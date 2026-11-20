@@ -1,0 +1,129 @@
+{
+ "J1": {
+  "fp": "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical",
+  "val": "Batterie (TP4056 OUT)",
+  "nets": {
+   "1": "VBAT",
+   "2": "GND"
+  },
+  "extra": {}
+ },
+ "C1": {
+  "fp": "Capacitor_SMD:C_0805_2012Metric",
+  "val": "10u",
+  "nets": {
+   "1": "VBAT",
+   "2": "GND"
+  },
+  "extra": {
+   "LCSC": "C15850",
+   "MPN": "CL21A106KAYNNNE"
+  }
+ },
+ "U1": {
+  "fp": "Package_TO_SOT_SMD:SOT-23-5",
+  "val": "AP2112K-3.3",
+  "nets": {
+   "1": "VBAT",
+   "2": "GND",
+   "3": "VBAT",
+   "5": "3V3"
+  },
+  "extra": {
+   "LCSC": "C51118",
+   "MPN": "AP2112K-3.3TRG1"
+  }
+ },
+ "C2": {
+  "fp": "Capacitor_SMD:C_0805_2012Metric",
+  "val": "22u",
+  "nets": {
+   "1": "3V3",
+   "2": "GND"
+  },
+  "extra": {
+   "LCSC": "C45783",
+   "MPN": "CL21A226MAQNNNE"
+  }
+ },
+ "C3": {
+  "fp": "Capacitor_SMD:C_1206_3216Metric",
+  "val": "100u",
+  "nets": {
+   "1": "3V3",
+   "2": "GND"
+  },
+  "extra": {
+   "LCSC": "C15008",
+   "MPN": "CL31A107MQHNNNE"
+  }
+ },
+ "J2": {
+  "fp": "Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical",
+  "val": "ESP32",
+  "nets": {
+   "1": "3V3",
+   "2": "RUMBLE",
+   "3": "GND"
+  },
+  "extra": {}
+ },
+ "R1": {
+  "fp": "Resistor_SMD:R_0805_2012Metric",
+  "val": "100",
+  "nets": {
+   "1": "RUMBLE",
+   "2": "GATE"
+  },
+  "extra": {
+   "LCSC": "C17408",
+   "MPN": "0805W8F1000T5E"
+  }
+ },
+ "R2": {
+  "fp": "Resistor_SMD:R_0805_2012Metric",
+  "val": "10k",
+  "nets": {
+   "1": "GATE",
+   "2": "GND"
+  },
+  "extra": {
+   "LCSC": "C17414",
+   "MPN": "0805W8F1002T5E"
+  }
+ },
+ "Q1": {
+  "fp": "Package_TO_SOT_SMD:SOT-23",
+  "val": "AO3400A",
+  "nets": {
+   "1": "GATE",
+   "2": "GND",
+   "3": "MOT-"
+  },
+  "extra": {
+   "LCSC": "C20917",
+   "MPN": "AO3400A"
+  }
+ },
+ "D1": {
+  "fp": "Diode_SMD:D_SOD-123",
+  "val": "B5819W",
+  "nets": {
+   "1": "VBAT",
+   "2": "MOT-"
+  },
+  "extra": {
+   "LCSC": "C8598",
+   "MPN": "B5819W"
+  }
+ },
+ "J3": {
+  "fp": "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical",
+  "val": "Moteur",
+  "nets": {
+   "1": "VBAT",
+   "2": "MOT-"
+  },
+  "extra": {}
+ }
+}

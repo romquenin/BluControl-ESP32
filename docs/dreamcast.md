@@ -31,7 +31,7 @@ From the [Releases](../../releases):
 |---|---|
 | ESP32-WROOM module | |
 | LiPo 3.7 V battery + TP4056 charger (USB-C) | about 130 mA while playing; 1000 mAh or more recommended |
-| 3.3 V regulator (we used a BluPower GC board, only its regulator U1 with C1 and C2; any 3.3 V LDO works) | powers the ESP32 |
+| 3.3 V low-dropout regulator: the [BluPower GC](blupower.md) board with its regulator part only (U1, C1, C2, C3), or any 3.3 V LDO with a low dropout | powers the ESP32 |
 | 5 V boost (MT3608 or fixed 5 V module) | powers the controller and the VMU (Maple devices expect 5 V) |
 | ON/OFF switch | cuts everything |
 | RGB LED, common anode | red on IO4 = Switch mode, blue on IO33 = BlueRetro mode |

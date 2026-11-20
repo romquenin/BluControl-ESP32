@@ -17,7 +17,13 @@ Ready-to-flash firmware is in the [Releases](../../releases).
 
 ## The BluPower GC board
 
-A small board made for this project: a low-dropout 3.3 V regulator for the ESP32 (it keeps working as the LiPo battery runs down) and a MOSFET that drives the GameCube rumble motor. It is fully populated for the GameCube version 1. Only its regulator is used for the Dreamcast and the GameCube cable mode. See [docs/blupower.md](docs/blupower.md).
+![BluPower GC](docs/images/blupower_gc_top.png)
+
+A small board (20.3 × 15.2 mm) made for this project:
+- an AP2112K low-dropout 3.3 V regulator for the ESP32, which keeps working as the LiPo battery runs down, where the usual AMS1117 cannot;
+- a MOSFET that drives the GameCube rumble motor.
+
+It is fully populated for the GameCube version 1. The Dreamcast and the GameCube cable mode only use its regulator. KiCad project, Gerbers and JLCPCB files are in [`hardware/blupower_gc/`](hardware/blupower_gc). Parts, wiring and ordering: [docs/blupower.md](docs/blupower.md).
 
 ## Repository layout
 
@@ -30,6 +36,7 @@ A small board made for this project: a low-dropout 3.3 V regulator for the ESP32
 | `configs/` | Build configuration per controller |
 | `patches/` | Small changes to JPZV's submodules, applied by `build.sh` |
 | `blueretro/` | Patch for BlueRetro v25.04 (Dreamcast VMU support) |
+| `hardware/` | BluPower GC board (KiCad, Gerbers, JLCPCB files) |
 | `docs/` | Documentation |
 
 ## Building
