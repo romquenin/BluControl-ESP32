@@ -13,7 +13,7 @@ Two ways to make a GameCube controller wireless with BluControl:
 
 ## Version 1: Yakara style, with rumble
 
-**If you followed [Yakara's GameCube tutorial](https://github.com/yakaracolombia/esp32-online-tool) and want rumble back, this is the method to use.** It keeps the same idea and the same wiring as the tutorial, and adds:
+**If you followed [Yakara's GameCube tutorial](https://github.com/yakaracolombia/esp32-online-tool/blob/main/gamecube.md) and want rumble back, this is the method to use.** It keeps the same idea and the same wiring as the tutorial, and adds:
 - **rumble**, through the [BluPower GC board](blupower.md), which drives the controller's motor from the battery. The board also replaces the ESP32 board's AMS1117 with a low-dropout regulator, which fixes Bluetooth disconnections on battery;
 - a **blue LED** for BlueRetro mode;
 - **pairing memory**: the controller remembers its host and reconnects to it;
@@ -56,4 +56,4 @@ The controller board stays intact. The ESP32 connects to the wires that normally
 
 ## Credits
 
-[Yakara](https://github.com/yakaracolombia), for the original GameCube wireless tutorial with BluControl. Version 1 builds on it.
+[Yakara](https://github.com/yakaracolombia), for the original [GameCube wireless tutorial](https://github.com/yakaracolombia/esp32-online-tool/blob/main/gamecube.md) with BluControl. Version 1 builds on it.

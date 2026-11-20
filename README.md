@@ -65,7 +65,7 @@ The modified BlueRetro is built separately: see [blueretro/README.md](blueretro/
   - **[h2zero](https://github.com/h2zero)**: esp-nimble-cpp.
 - **[darthcloud](https://github.com/darthcloud)**: [BlueRetro](https://github.com/darthcloud/BlueRetro). The Dreamcast VMU support is a patch on BlueRetro v25.04.
 - **[dpedu.io](https://dpedu.io/article/2015-03-11/nintendo-64-joystick-pinout-arduino)**: credited by the original BluControl for his article on N64 analogs.
-- **[Yakara](https://github.com/yakaracolombia)**: for the GameCube wireless mod that inspired our GameCube work.
+- **[Yakara](https://github.com/yakaracolombia)**: for the [GameCube wireless tutorial](https://github.com/yakaracolombia/esp32-online-tool/blob/main/gamecube.md) that inspired our GameCube work.
 
 ## License
 
