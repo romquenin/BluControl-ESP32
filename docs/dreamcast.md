@@ -15,7 +15,7 @@ Tested on real hardware (November 2026):
 
 ## Downloads
 
-From the [Releases](../../releases):
+From the [Releases](https://github.com/romquenin/BluControl-ESP32/releases):
 
 | File | Where |
 |---|---|

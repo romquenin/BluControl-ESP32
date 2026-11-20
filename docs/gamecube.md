@@ -1,10 +1,10 @@
 # Wireless GameCube controller
 
-> 🚧 **Draft: firmware not published yet.** This page describes what is coming. Download links will be added when the firmware is released.
+Version 1 is released. Version 2 is in development.
 
 Two ways to make a GameCube controller wireless with BluControl:
 
-| | Version 1: Yakara style, with rumble | Version 2: cable mode (in development) |
+| | Version 1: Yakara style, with rumble ✅ | Version 2: cable mode 🚧 |
 |---|---|---|
 | Controller board | components removed, as in Yakara's tutorial | **kept intact** |
 | How the ESP32 reads the controller | buttons, sticks and triggers wired directly to the ESP32 | plays the console's role on the controller's data line (Joybus) |
@@ -18,6 +18,17 @@ Two ways to make a GameCube controller wireless with BluControl:
 - a **blue LED** for BlueRetro mode;
 - **pairing memory**: the controller remembers its host and reconnects to it;
 - several fixes in the Switch and BLE libraries: a memory leak in the rumble handler, correct reading of Switch HD rumble, and the motor stopping if Bluetooth is lost.
+
+### Downloads
+
+From the [Releases](https://github.com/romquenin/BluControl-ESP32/releases) (latest release):
+
+| File | Where |
+|---|---|
+| `BluControl_GameCube_v1.updpkg` | Wi-Fi update |
+| `BluControl_GameCube_v1_FULL_0x0.bin` | first install or recovery over USB, at address **0x0** (Flash Download Tool: ESP32, 40 MHz, DIO) |
+
+The partition table is the same as Yakara's firmware, so a controller already running it can be updated over Wi-Fi.
 
 ### Wiring
 

@@ -11,9 +11,9 @@ This fork only keeps what these controllers need. For the other controllers supp
 | Controller | Status | Page |
 |---|---|---|
 | **Sega Dreamcast** | ✅ v1: buttons, stick, analog triggers, and the **VMU** (saves and screen) through a modified BlueRetro, with 4 VMU pages (800 blocks) | [docs/dreamcast.md](docs/dreamcast.md) |
-| **Nintendo GameCube** | 🚧 Coming: version 1 in Yakara's style with rumble, and version 2 "cable mode" with the controller board kept intact | [docs/gamecube.md](docs/gamecube.md) |
+| **Nintendo GameCube** | ✅ v1: in Yakara's style, with rumble through the BluPower GC board · 🚧 v2 "cable mode", with the controller board kept intact | [docs/gamecube.md](docs/gamecube.md) |
 
-Ready-to-flash firmware is in the [Releases](../../releases).
+Ready-to-flash firmware is in the [Releases](https://github.com/romquenin/BluControl-ESP32/releases). Each release contains the latest firmware for every controller.
 
 ## The BluPower GC board
 
@@ -47,12 +47,12 @@ Requires **ESP-IDF v5.0** and Node.js (for the update web page).
 git clone --recursive https://github.com/romquenin/BluControl-ESP32
 cd BluControl-ESP32
 . $IDF_PATH/export.sh
-./build.sh dreamcast
+./build.sh dreamcast    # or: ./build.sh gamecube
 ```
 
 The script applies the patches, builds the three modes, and writes two files to `release/`:
-- `BluControl_dreamcast_FULL_0x0.bin`: full USB flash at address 0x0;
-- `BluControl_dreamcast.updpkg`: Wi-Fi update.
+- `BluControl_<config>_FULL_0x0.bin`: full USB flash at address 0x0;
+- `BluControl_<config>.updpkg`: Wi-Fi update.
 
 The modified BlueRetro is built separately: see [blueretro/README.md](blueretro/README.md).
 
