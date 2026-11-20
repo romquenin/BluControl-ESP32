@@ -11,9 +11,13 @@ This fork only keeps what these controllers need. For the other controllers supp
 | Controller | Status | Page |
 |---|---|---|
 | **Sega Dreamcast** | ✅ v1: buttons, stick, analog triggers, and the **VMU** (saves and screen) through a modified BlueRetro, with 4 VMU pages (800 blocks) | [docs/dreamcast.md](docs/dreamcast.md) |
-| **Nintendo GameCube** | 🚧 Work in progress | [docs/gamecube.md](docs/gamecube.md) |
+| **Nintendo GameCube** | 🚧 Coming: version 1 in Yakara's style with rumble, and version 2 "cable mode" with the controller board kept intact | [docs/gamecube.md](docs/gamecube.md) |
 
 Ready-to-flash firmware is in the [Releases](../../releases).
+
+## The BluPower GC board
+
+A small board made for this project: a low-dropout 3.3 V regulator for the ESP32 (it keeps working as the LiPo battery runs down) and a MOSFET that drives the GameCube rumble motor. It is fully populated for the GameCube version 1. Only its regulator is used for the Dreamcast and the GameCube cable mode. See [docs/blupower.md](docs/blupower.md).
 
 ## Repository layout
 

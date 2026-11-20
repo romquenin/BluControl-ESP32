@@ -1,9 +1,57 @@
 # Wireless GameCube controller
 
-🚧 **Work in progress**: nothing is published for the GameCube yet.
+> 🚧 **Draft: firmware not published yet.** This page describes what is coming. Download links will be added when the firmware is released.
 
-The plan is to keep an original GameCube controller completely intact:
-- the ESP32 connects to the wires that normally go to the console, and plays the console's role on the controller's data line (Joybus);
-- rumble is driven through the Joybus protocol itself, with a 5 V supply on the controller's rumble power line, so no extra rumble board is needed.
+Two ways to make a GameCube controller wireless with BluControl:
 
-Thanks to [Yakara](https://github.com/yakaracolombia) for the GameCube wireless mod that inspired this work.
+| | Version 1: Yakara style, with rumble | Version 2: cable mode (in development) |
+|---|---|---|
+| Controller board | components removed, as in Yakara's tutorial | **kept intact** |
+| How the ESP32 reads the controller | buttons, sticks and triggers wired directly to the ESP32 | plays the console's role on the controller's data line (Joybus) |
+| Rumble | driven by the ESP32 through the **BluPower GC** board (MOSFET) | driven by the controller itself, through the protocol |
+| BluPower GC board | **fully populated** (regulator + rumble driver) | regulator only (U1, C1, C2), plus a 5 V boost |
+
+## Version 1: Yakara style, with rumble
+
+**If you followed [Yakara's GameCube tutorial](https://github.com/yakaracolombia/esp32-online-tool) and want rumble back, this is the method to use.** It keeps the same idea and the same wiring as the tutorial, and adds:
+- **rumble**, through the [BluPower GC board](blupower.md), which drives the controller's motor from the battery;
+- a **blue LED** for BlueRetro mode;
+- **pairing memory**: the controller remembers its host and reconnects to it;
+- several fixes in the Switch and BLE libraries: a memory leak in the rumble handler, correct reading of Switch HD rumble, and the motor stopping if Bluetooth is lost.
+
+### Wiring
+
+Follow Yakara's tutorial for the controller side (buttons, sticks, triggers). Pin assignment used by this firmware:
+
+| Function | GPIO |
+|---|---|
+| A / B / X / Y | 14 / 27 / 2 / 15 |
+| D-pad up / down / left / right | 5 / 19 / 17 / 18 |
+| L / R (digital) / Z | 16 / 13 / 12 |
+| Start | 21 |
+| L / R analog triggers | 34 / 26 |
+| Main stick X / Y | 35 / 32 |
+| C-stick X / Y | 33 / 25 |
+| **Rumble** (gate of the BluPower GC MOSFET) | **23** |
+| Red LED (Switch mode) | 4 |
+| Blue LED (BlueRetro mode) | 22 |
+
+Do not use IO0 for the LED: the ESP32 reads it at boot, and pulling it low keeps the ESP32 in programming mode.
+
+### Using it
+
+| Action | How |
+|---|---|
+| Change mode | hold **Z + Start** for 5 s (red LED = Switch, blue LED = BlueRetro) |
+| Wi-Fi update | hold **Z + Start** while switching on, about 6 s, then join the "BluControl OTA" network and open http://192.168.4.1 |
+| Erase pairings | hold **X + Y** while switching on, about 1 s. The LEDs blink 6 times |
+
+After a Wi-Fi update, the controller restarts in Switch mode. Hold Z + Start for 5 s to go back to BlueRetro mode.
+
+## Version 2: cable mode (in development)
+
+The controller board stays intact. The ESP32 connects to the wires that normally go to the console and talks to the controller over Joybus, like a GameCube does. Rumble is requested through the protocol, and the controller drives its own motor from the 5 V line. The BluPower GC board then only needs its regulator (U1, C1, C2), plus a 5 V boost, as for the [Dreamcast controller](dreamcast.md).
+
+## Credits
+
+[Yakara](https://github.com/yakaracolombia), for the original GameCube wireless tutorial with BluControl. Version 1 builds on it.
