@@ -1,0 +1,1547 @@
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index e6cf38a..07f5a3f 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -63,6 +63,7 @@ set(srcs
+     "system/led.c"
+     "system/bare_metal_app_cpu.c"
+     "system/core0_stall.c"
++    "system/crashlog.c"
+     "system/core0_stall_highint_hdl.S"
+     "system/startup.c"
+     "tools/stats.c"
+@@ -125,3 +126,5 @@ idf_build_set_property(COMPILE_DEFINITIONS "-DXT_INTEXC_HOOKS" APPEND)
+ 
+ target_link_libraries(${COMPONENT_TARGET} "-u ld_include_my_startup_file")
+ target_link_libraries(${COMPONENT_TARGET} "-u ld_include_core0_stall_highint_hdl")
++target_link_libraries(${COMPONENT_TARGET} "-Wl,--wrap=esp_panic_handler")
++target_link_libraries(${COMPONENT_TARGET} "-u esp_task_wdt_isr_user_handler")
+diff --git a/main/adapter/memory_card.c b/main/adapter/memory_card.c
+index d37964b..874fb7e 100644
+--- a/main/adapter/memory_card.c
++++ b/main/adapter/memory_card.c
+@@ -8,21 +8,117 @@
+ #include <sys/stat.h>
+ #include <esp_heap_caps.h>
+ #include <esp_timer.h>
++#include <esp_spiffs.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++#include <esp_attr.h>
+ #include <soc/soc_memory_layout.h>
+ #include "xtensa/core-macros.h"
+ #include "sdkconfig.h"
+ #include "system/fs.h"
+ #include "config.h"
+ #include "memory_card.h"
++#include "page_lcd.h"
++#include "system/crashlog.h"
+ 
+ /* Related to bare metal hack, something goes writing there. */
+ /* Workaround: Remove region from heap pool until I figure it out */
+ SOC_RESERVE_MEMORY_REGION(0x3FFE7D98, 0x3FFE7E28, bad_region);
+ 
+ static uint8_t *mc_buffer[MC_BUFFER_BLOCK_CNT] = {0};
++
++/* mc_write runs on the bare-metal core 1, which cannot execute from flash.
++ * atomic_set_bit() used elsewhere made GCC emit a shared out-of-line copy in
++ * flash, called by mc_write: core 1 crashed on every console write. */
++#define MC_SET_BIT(target, bit) __atomic_fetch_or((target), (int32_t)(1u << (bit)), __ATOMIC_SEQ_CST)
+ static esp_timer_handle_t mc_timer_hdl = NULL;
+ static int32_t mc_block_state = 0;
+ 
++/* ---- remote VMU (BluControl Dreamcast pad) ---- */
++enum {
++    MC_REMOTE_OFF = 0,
++    MC_REMOTE_SYNC,     /* receiving the copy, VMU hidden */
++    MC_REMOTE_ON,       /* copy shown to the console, mirrored in the internal file */
++    MC_REMOTE_RESTORE,  /* sync failed: back to the internal VMU (file reload) */
++    MC_REMOTE_LEAVE,    /* pad gone: buffer = mirror, finish writing it to the file */
++    MC_REMOTE_PREP,     /* pad found: save the current page, go to page 1, then ask the copy */
++};
++DRAM_ATTR volatile uint32_t mc_hidden = 0;
++DRAM_ATTR volatile uint32_t mc_remote_on = 0;
++static mc_remote_send_t mc_remote_send = NULL;
++/* write-back to the pad: phases written per block, blocks ready to send */
++static DRAM_ATTR uint8_t mc_remote_phases[256];
++static DRAM_ATTR uint32_t mc_remote_ready[8];
++/* VMU screen (48x32, 192 bytes, bus byte order) */
++static DRAM_ATTR uint8_t mc_remote_lcd_buf[192];
++static DRAM_ATTR volatile uint32_t mc_remote_lcd_pending = 0;
++static volatile uint32_t mc_remote_state = MC_REMOTE_OFF;
++static int32_t mc_remote_dev = -1;
++static uint32_t mc_remote_bytes = 0;
++static esp_timer_handle_t mc_remote_timer_hdl = NULL;
++#define MC_REMOTE_TIMEOUT_US (30 * 1000000)
++static void (*mc_remote_req)(int32_t dev_id) = NULL;
++static volatile uint32_t mc_remote_req_pending = 0;
++
++/* Every Bluetooth message to the pad must leave from BlueRetro's feedback task:
++ * the ATT/HCI builders share one scratch packet (bt_hci_pkt_tmp), and sending
++ * from another task corrupts packets (seen: BLE scanning stopped). */
++static void mc_kick_fb(void) {
++    struct raw_fb fb_data = {0};
++    fb_data.header.wired_id = 0;
++    fb_data.header.type = FB_TYPE_MEM_WRITE;
++    fb_data.header.data_len = 0;
++    adapter_q_fb(&fb_data);
++}
++
++/* ---- pages: 4 VMUs of 200 blocks, one in RAM at a time ----
++ * page 0 = /fs/mc.bin (mirror of the BluControl pad's VMU), pages 1-3 = /fs/mc2.bin .. mc4.bin */
++#define MC_PAGE_CNT 4
++static uint32_t mc_page = 0;
++static volatile int32_t mc_page_req = 0;
++static volatile uint32_t mc_fs_errors = 0;
++static volatile uint32_t mc_mirror_check = 0;
++#define MC_PAGE_MIN_FREE (192 * 1024)   /* new page: 128 KB + room for the file system */
++
++static size_t mc_fs_free(void) {
++    size_t total = 0, used = 0;
++    if (esp_spiffs_info(NULL, &total, &used) != ESP_OK || used > total) {
++        return 0;
++    }
++    return total - used;
++}
++
++uint32_t mc_fs_used_pct(void) {
++    size_t total = 0, used = 0;
++    if (esp_spiffs_info(NULL, &total, &used) != ESP_OK || total == 0) {
++        return 99;
++    }
++    return (uint32_t)((used * 100) / total);
++}
++
++uint32_t mc_fs_err_get(void) {
++    return mc_fs_errors;
++}
++
++/* All file work (saves, mirror, pages) runs in a LOWEST priority task.
++ * When SPIFFS has to garbage-collect, one write can take seconds: in the
++ * esp_timer task (priority 22) that blocked Bluetooth (pads disconnected)
++ * and the idle task (task watchdog reset, seen as reset reason 6). */
++#define MC_TASK_REMOTE BIT(0)
++#define MC_TASK_STORE  BIT(1)
++static TaskHandle_t mc_task_hdl = NULL;
++static volatile uint32_t mc_busy = 0;
++static void mc_task(void *arg);
++
++static const char *mc_page_file(uint32_t page) {
++    static char path[24];
++    if (page == 0) {
++        return MEMORY_CARD_FILE;
++    }
++    snprintf(path, sizeof(path), ROOT "/mc%ld.bin", page + 1);
++    return path;
++}
++
+ static int32_t mc_restore(void);
+ static int32_t mc_store(void);
+ static inline void mc_store_cb(void *arg);
+@@ -39,13 +135,14 @@ static void mc_start_update_timer(uint64_t timeout_us) {
+ static int32_t mc_restore(void) {
+     struct stat st;
+     int32_t ret = -1;
++    crashlog_step(50);
+ 
+-    if (stat(MEMORY_CARD_FILE, &st) != 0) {
++    if (stat(mc_page_file(mc_page), &st) != 0) {
+         printf("# %s: No Memory Card on FS. Creating...\n", __FUNCTION__);
+         ret = mc_store();
+     }
+     else {
+-        FILE *file = fopen(MEMORY_CARD_FILE, "rb");
++        FILE *file = fopen(mc_page_file(mc_page), "rb");
+         if (file == NULL) {
+             printf("# %s: failed to open file for reading\n", __FUNCTION__);
+         }
+@@ -61,6 +158,7 @@ static int32_t mc_restore(void) {
+                 printf("# %s: restore sucessful!\n", __FUNCTION__);
+             }
+             else {
++                mc_fs_errors++;
+                 printf("# %s: restore failed! cnt: %ld File size:%ld\n", __FUNCTION__, count, st.st_size);
+             }
+         }
+@@ -70,8 +168,9 @@ static int32_t mc_restore(void) {
+ 
+ static int32_t mc_store(void) {
+     int32_t ret = -1;
++    crashlog_step(51);
+ 
+-    FILE *file = fopen(MEMORY_CARD_FILE, "wb");
++    FILE *file = fopen(mc_page_file(mc_page), "wb");
+     if (file == NULL) {
+         printf("# %s: failed to open file for writing\n", __FUNCTION__);
+     }
+@@ -86,6 +185,9 @@ static int32_t mc_store(void) {
+             ret = 0;
+             mc_block_state = 0;
+         }
++        else {
++            mc_fs_errors++;
++        }
+         printf("# %s: file updated cnt: %ld\n", __FUNCTION__, count);
+     }
+     return ret;
+@@ -94,25 +196,49 @@ static int32_t mc_store(void) {
+ static int32_t mc_store_spread(void) {
+     int32_t ret = -1;
+ 
+-    FILE *file = fopen(MEMORY_CARD_FILE, "r+b");
++    if (mc_remote_state != MC_REMOTE_OFF && mc_remote_state != MC_REMOTE_ON
++        && mc_remote_state != MC_REMOTE_PREP) {
++        /* buffer incomplete (sync) or being replaced: never write it in the file */
++        return ret;
++    }
++
++    if (mc_block_state == 0) {
++        /* nothing to write: do not open (and leak) the file */
++        return 0;
++    }
++
++    crashlog_step(20);
++    FILE *file = fopen(mc_page_file(mc_page), "r+b");
++    crashlog_step(21);
+     if (file == NULL) {
++        mc_fs_errors++;
+         printf("# %s: failed to open file for writing\n", __FUNCTION__);
+     }
+     else {
+         uint32_t block = __builtin_ffs(mc_block_state);
+ 
+-        if (block) {
++        if (!block) {
++            fclose(file);
++        }
++        else {
+             uint32_t count = 0;
+             block -= 1;
+ 
+             fseek(file, block * MC_BUFFER_BLOCK_SIZE, SEEK_SET);
++            crashlog_step(22);
+             count = fwrite((void *)mc_buffer[block], MC_BUFFER_BLOCK_SIZE, 1, file);
++            crashlog_step(23);
+             fclose(file);
++            crashlog_step(24);
++            crashlog_written();
+ 
+             if (count == 1) {
+                 ret = 0;
+                 atomic_clear_bit(&mc_block_state, block);
+             }
++            else {
++                mc_fs_errors++;
++            }
+ 
+             printf("# %s: block %ld updated cnt: %ld\n", __FUNCTION__, block, count);
+ 
+@@ -124,13 +250,18 @@ static int32_t mc_store_spread(void) {
+     return ret;
+ }
+ 
+-static inline void mc_store_cb(void *arg) {
+-    (void)mc_store_spread();
++static void mc_store_cb(void *arg) {
++    if (mc_task_hdl) {
++        xTaskNotify(mc_task_hdl, MC_TASK_STORE, eSetBits);
++    }
++    else {
++        (void)mc_store_spread();
++    }
+ }
+ 
+ int32_t mc_init_mem(void) {
+     for (uint32_t i = 0; i < MC_BUFFER_BLOCK_CNT; i++) {
+-        mc_buffer[i] = malloc(MC_BUFFER_BLOCK_SIZE);
++        mc_buffer[i] = heap_caps_malloc(MC_BUFFER_BLOCK_SIZE, MALLOC_CAP_DMA);   /* as upstream (bare core) */
+ 
+         if (mc_buffer[i] == NULL) {
+             printf("# %s mc_buffer[%ld] alloc fail\n", __FUNCTION__, i);
+@@ -153,6 +284,30 @@ int32_t mc_init(void) {
+         };
+ 
+         esp_timer_create(&mc_timer_args, &mc_timer_hdl);
++        if (mc_task_hdl == NULL) {
++            /* priority 0 = same as idle: Bluetooth always goes first */
++            xTaskCreatePinnedToCore(mc_task, "mc_task", 5120, NULL, tskIDLE_PRIORITY, &mc_task_hdl, 0);
++        }
++        /* the 5-page test builds: free the room of page 5 */
++        if (remove(ROOT "/mc5.bin") == 0) {
++            printf("# %s: old page 5 removed\n", __FUNCTION__);
++        }
++        /* once: pages 2-4 formatted by the older firmware are recreated
++         * unformatted, for the BIOS to format them */
++        {
++            struct stat st;
++            if (stat(ROOT "/mcpages2.bin", &st) != 0) {
++                remove(ROOT "/mc2.bin");
++                remove(ROOT "/mc3.bin");
++                remove(ROOT "/mc4.bin");
++                FILE *f = fopen(ROOT "/mcpages2.bin", "wb");
++                if (f) {
++                    fputc(1, f);
++                    fclose(f);
++                }
++                printf("# %s: pages 2-4 reset (formatted by the BIOS from now on)\n", __FUNCTION__);
++            }
++        }
+ 
+         ret = mc_restore();
+     }
+@@ -160,12 +315,49 @@ int32_t mc_init(void) {
+     return ret;
+ }
+ 
++static void mc_remote_flush(void);
++
+ void mc_storage_update(void) {
++    uint32_t step = cl_live.step;
++    crashlog_step(40);
++    if (mc_remote_req_pending) {
++        mc_remote_req_pending = 0;
++        if (mc_remote_req && mc_remote_state == MC_REMOTE_SYNC) {
++            mc_remote_req(mc_remote_dev);   /* "send me your VMU", from the feedback task */
++        }
++    }
++    if (mc_remote_state == MC_REMOTE_ON) {
++        /* to the pad's VMU, and mirrored in the internal file below */
++        mc_remote_flush();
++    }
++    else if (mc_remote_state != MC_REMOTE_OFF) {
++        crashlog_step(step);
++        return;
++    }
+     mc_start_update_timer(1000000);
++    crashlog_step(step);
++}
++
++void IRAM_ATTR mc_remote_lcd(const uint8_t *data) {
++    struct raw_fb fb_data = {0};
++
++    if (!mc_remote_on) {
++        return;
++    }
++    memcpy(mc_remote_lcd_buf, data, sizeof(mc_remote_lcd_buf));
++    mc_remote_lcd_pending = 1;
++    fb_data.header.wired_id = 0;
++    fb_data.header.type = FB_TYPE_MEM_WRITE;
++    fb_data.header.data_len = 0;
++    adapter_q_fb(&fb_data);
+ }
+ 
+ /* Assume r/w size will never cross blocks boundary */
+ void IRAM_ATTR mc_read(uint32_t addr, uint8_t *data, uint32_t size) {
++    if (addr + size > MC_BUFFER_SIZE || ((addr & 0xFFF) + size) > MC_BUFFER_BLOCK_SIZE) {
++        memset(data, 0, size);
++        return;
++    }
+     memcpy(data, mc_buffer[addr >> 12] + (addr & 0xFFF), size);
+ }
+ 
+@@ -173,10 +365,43 @@ void IRAM_ATTR mc_write(uint32_t addr, uint8_t *data, uint32_t size) {
+     struct raw_fb fb_data = {0};
+     uint32_t block = addr >> 12;
+ 
++    if (addr + size > MC_BUFFER_SIZE || ((addr & 0xFFF) + size) > MC_BUFFER_BLOCK_SIZE) {
++        return;     /* damaged frame (bad phase): never write outside the buffer */
++    }
++
+     memcpy(mc_buffer[block] + (addr & 0xFFF), data, size);
+ 
++    if (mc_remote_state != MC_REMOTE_OFF) {
++        /* pad's VMU: whole blocks go back to the pad, and every write is
++         * mirrored in the internal file (the internal VMU = backup of the pad's) */
++        if (mc_remote_state == MC_REMOTE_ON && config.global_cfg.banksel < CONFIG_BANKSEL_MAX) {
++            MC_SET_BIT(&mc_block_state, block);
++            if (mc_page != 0) {
++                /* pages 2-5 live only in BlueRetro: normal save timer */
++                fb_data.header.wired_id = 0;
++                fb_data.header.type = FB_TYPE_MEM_WRITE;
++                fb_data.header.data_len = 0;
++                adapter_q_fb(&fb_data);
++            }
++        }
++        if (mc_remote_state == MC_REMOTE_ON && mc_page == 0 && size == 128) {
++            uint32_t vblock = (addr >> 9) & 0xFF;
++            uint32_t phase = (addr >> 7) & 0x3;
++            mc_remote_phases[vblock] |= (1 << phase);
++            if (mc_remote_phases[vblock] == 0x0F) {
++                mc_remote_phases[vblock] = 0;
++                __atomic_fetch_or(&mc_remote_ready[vblock >> 5], (1u << (vblock & 31)), __ATOMIC_SEQ_CST);
++                fb_data.header.wired_id = 0;
++                fb_data.header.type = FB_TYPE_MEM_WRITE;
++                fb_data.header.data_len = 0;
++                adapter_q_fb(&fb_data);
++            }
++        }
++        return;
++    }
++
+     if (config.global_cfg.banksel < CONFIG_BANKSEL_MAX) {
+-        atomic_set_bit(&mc_block_state, block);
++        MC_SET_BIT(&mc_block_state, block);
+ 
+         fb_data.header.wired_id = 0;
+         fb_data.header.type = FB_TYPE_MEM_WRITE;
+@@ -188,3 +413,410 @@ void IRAM_ATTR mc_write(uint32_t addr, uint8_t *data, uint32_t size) {
+ uint8_t IRAM_ATTR *mc_get_ptr(uint32_t addr) {
+     return mc_buffer[addr >> 12] + (addr & 0xFFF);
+ }
++
++/* ---------------- remote VMU ---------------- */
++
++/* esp_timer task: sync timeout, or back to the internal VMU (file read) */
++static void mc_page_switch(int32_t step);
++static void mc_flush_all(void);
++
++static void mc_remote_work(void);
++
++static void mc_remote_cb(void *arg) {
++    if (mc_task_hdl) {
++        xTaskNotify(mc_task_hdl, MC_TASK_REMOTE, eSetBits);
++    }
++    else {
++        mc_remote_work();
++    }
++}
++
++static void mc_task(void *arg) {
++    uint32_t bits;
++
++    while (1) {
++        if (xTaskNotifyWait(0, 0xFFFFFFFF, &bits, portMAX_DELAY) == pdTRUE) {
++            mc_busy = 1;
++            if (bits & MC_TASK_REMOTE) {
++                crashlog_step(30);
++                mc_remote_work();
++            }
++            if (bits & MC_TASK_STORE) {
++                crashlog_step(25);
++                (void)mc_store_spread();
++            }
++            mc_busy = 0;
++            crashlog_step(10);
++        }
++    }
++}
++
++static void mc_remote_work(void) {
++    if (mc_page_req && (mc_remote_state == MC_REMOTE_OFF || mc_remote_state == MC_REMOTE_ON)) {
++        int32_t step = mc_page_req;
++        mc_page_req = 0;
++        mc_page_switch(step);
++        return;
++    }
++    mc_page_req = 0;
++    if (mc_mirror_check) {
++        mc_mirror_check = 0;
++        if (mc_remote_state == MC_REMOTE_ON && mc_page == 0) {
++            static uint8_t tmp[512];
++            FILE *file = fopen(mc_page_file(0), "rb");
++            uint32_t diff = 0;
++            for (uint32_t i = 0; i < MC_BUFFER_BLOCK_CNT; i++) {
++                uint32_t same = (file != NULL);
++                for (uint32_t k = 0; k < MC_BUFFER_BLOCK_SIZE / 512; k++) {
++                    if (file == NULL || fread(tmp, 512, 1, file) != 1) {
++                        same = 0;
++                        break;
++                    }
++                    if (same && memcmp(tmp, mc_buffer[i] + k * 512, 512) != 0) {
++                        same = 0;   /* keep reading to stay aligned */
++                    }
++                }
++                if (!same) {
++                    MC_SET_BIT(&mc_block_state, i);
++                    diff++;
++                }
++            }
++            if (file) {
++                fclose(file);
++            }
++            printf("# %s: mirror, %ld blocks to update\n", __FUNCTION__, diff);
++            if (mc_block_state) {
++                mc_start_update_timer(20000);
++            }
++        }
++        return;
++    }
++    if (mc_remote_state == MC_REMOTE_PREP) {
++        /* save what is pending on the current page, then page 1 receives the pad copy */
++        mc_flush_all();
++        mc_page = 0;
++        mc_block_state = 0;
++        mc_remote_bytes = 0;
++        mc_remote_state = MC_REMOTE_SYNC;
++        esp_timer_start_once(mc_remote_timer_hdl, MC_REMOTE_TIMEOUT_US);
++        mc_remote_req_pending = 1;
++        mc_kick_fb();
++        printf("# %s: page 1, waiting for the pad VMU\n", __FUNCTION__);
++        return;
++    }
++    if (mc_remote_state == MC_REMOTE_SYNC) {
++        printf("# %s: remote VMU sync timeout (%ld bytes)\n", __FUNCTION__, mc_remote_bytes);
++        mc_hidden = 1;
++        mc_remote_state = MC_REMOTE_RESTORE;
++    }
++    if (mc_remote_state == MC_REMOTE_LEAVE) {
++        /* the buffer is the mirror: write what is left, keep it as the internal VMU */
++        mc_remote_state = MC_REMOTE_OFF;
++        while (mc_block_state) {
++            if (mc_store_spread() != 0) {
++                break;
++            }
++        }
++        if (mc_timer_hdl && esp_timer_is_active(mc_timer_hdl)) {
++            esp_timer_stop(mc_timer_hdl);
++        }
++        mc_remote_dev = -1;
++        mc_remote_send = NULL;
++        mc_hidden = 0;
++        printf("# %s: pad gone, internal VMU = mirror of the pad VMU\n", __FUNCTION__);
++        return;
++    }
++    if (mc_remote_state == MC_REMOTE_RESTORE) {
++        (void)mc_restore();
++        mc_block_state = 0;
++        mc_remote_dev = -1;
++        mc_remote_send = NULL;
++        mc_remote_state = MC_REMOTE_OFF;
++        mc_hidden = 0;
++        printf("# %s: internal VMU back\n", __FUNCTION__);
++    }
++}
++
++static void mc_remote_abort(void) {
++    mc_hidden = 1;
++    mc_remote_on = 0;
++    mc_remote_state = (mc_remote_state == MC_REMOTE_ON) ? MC_REMOTE_LEAVE : MC_REMOTE_RESTORE;
++    if (mc_remote_timer_hdl) {
++        if (esp_timer_is_active(mc_remote_timer_hdl)) {
++            esp_timer_stop(mc_remote_timer_hdl);
++        }
++        /* file access out of the Bluetooth context; short delay = VMU "unplugged" for the console */
++        esp_timer_start_once(mc_remote_timer_hdl, 100000);
++    }
++}
++
++static int32_t mc_remote_timer_init(void) {
++    if (mc_remote_timer_hdl == NULL) {
++        const esp_timer_create_args_t args = {
++            .callback = &mc_remote_cb,
++            .arg = (void *)NULL,
++            .name = "mc_remote"
++        };
++        if (esp_timer_create(&args, &mc_remote_timer_hdl) != ESP_OK) {
++            mc_remote_timer_hdl = NULL;
++            return -1;
++        }
++    }
++    return 0;
++}
++
++int32_t mc_remote_begin(int32_t dev_id, mc_remote_send_t send, void (*req)(int32_t dev_id)) {
++    if (mc_timer_hdl == NULL || mc_remote_state != MC_REMOTE_OFF) {
++        return -1;
++    }
++    if (mc_remote_timer_init() != 0) {
++        return -1;
++    }
++    if (esp_timer_is_active(mc_remote_timer_hdl)) {
++        esp_timer_stop(mc_remote_timer_hdl);
++    }
++    if (mc_timer_hdl && esp_timer_is_active(mc_timer_hdl)) {
++        esp_timer_stop(mc_timer_hdl);
++    }
++    mc_hidden = 1;
++    mc_remote_on = 0;
++    mc_remote_bytes = 0;
++    mc_remote_dev = dev_id;
++    mc_remote_send = send;
++    mc_remote_req = req;
++    mc_page_req = 0;
++    mc_remote_lcd_pending = 0;
++    memset(mc_remote_phases, 0, sizeof(mc_remote_phases));
++    memset(mc_remote_ready, 0, sizeof(mc_remote_ready));
++    /* pending saves and the switch to page 1 are done by the timer task (file access) */
++    mc_remote_state = MC_REMOTE_PREP;
++    esp_timer_start_once(mc_remote_timer_hdl, 1000);
++    printf("# %s: dev %ld, preparing page 1 for the pad VMU\n", __FUNCTION__, dev_id);
++    return 0;
++}
++
++/* Notifications from the pad:
++ *  0x10 block offset_lo offset_hi data... : part of a 512-byte block (wire byte order)
++ *  0x11 code : 0x01 start, 0x02 end, 0xE0 no VMU in the pad, 0xE1 VMU read error */
++void mc_remote_rx(const uint8_t *data, uint32_t len) {
++    if (mc_remote_state != MC_REMOTE_SYNC || len < 2) {
++        return;
++    }
++    if (data[0] == 0x10 && len > 4) {
++        uint32_t block = data[1];
++        uint32_t offset = data[2] | (data[3] << 8);
++        uint32_t size = len - 4;
++        if (offset + size <= 512) {
++            memcpy(mc_get_ptr(block * 512 + offset), data + 4, size);
++            mc_remote_bytes += size;
++        }
++    }
++    else if (data[0] == 0x11) {
++        switch (data[1]) {
++            case 0x01:
++                esp_timer_stop(mc_remote_timer_hdl);
++                esp_timer_start_once(mc_remote_timer_hdl, MC_REMOTE_TIMEOUT_US);
++                break;
++            case 0x02:
++                if (mc_remote_bytes == MC_BUFFER_SIZE) {
++                    esp_timer_stop(mc_remote_timer_hdl);
++                    mc_remote_state = MC_REMOTE_ON;
++                    mc_remote_on = 1;
++                    mc_hidden = 0;
++                    /* mirror: the whole copy replaces the internal VMU file */
++                    if (config.global_cfg.banksel < CONFIG_BANKSEL_MAX) {
++                        /* the timer task writes only the 4 KB blocks that differ */
++                        mc_mirror_check = 1;
++                        esp_timer_start_once(mc_remote_timer_hdl, 1000);
++                    }
++                    printf("# %s: pad VMU ready, mirrored in the internal VMU\n", __FUNCTION__);
++                }
++                else {
++                    printf("# %s: pad VMU incomplete (%ld bytes)\n", __FUNCTION__, mc_remote_bytes);
++                    mc_remote_abort();
++                }
++                break;
++            default:
++                printf("# %s: pad reports 0x%02X, internal VMU kept\n", __FUNCTION__, data[1]);
++                mc_remote_abort();
++                break;
++        }
++    }
++}
++
++void mc_remote_end(int32_t dev_id) {
++    if ((mc_remote_state == MC_REMOTE_SYNC || mc_remote_state == MC_REMOTE_ON
++        || mc_remote_state == MC_REMOTE_PREP) && dev_id == mc_remote_dev) {
++        printf("# %s: pad disconnected\n", __FUNCTION__);
++        mc_remote_abort();
++    }
++}
++
++/* Bluetooth feedback task: sends finished blocks and the screen to the pad.
++ *  0x02 block phase data[128] : one quarter of a block (the 4 are sent in a row)
++ *  0x03 data[192]             : VMU screen */
++static void mc_remote_flush(void) {
++    static uint8_t msg[1 + 192];
++
++    if (mc_remote_state != MC_REMOTE_ON || mc_remote_send == NULL) {
++        return;
++    }
++    for (uint32_t w = 0; w < 8; w++) {
++        uint32_t bits = __atomic_exchange_n(&mc_remote_ready[w], 0, __ATOMIC_SEQ_CST);
++        while (bits) {
++            uint32_t bit = __builtin_ctz(bits);
++            uint32_t block = w * 32 + bit;
++            bits &= ~(1u << bit);
++            for (uint32_t phase = 0; phase < 4; phase++) {
++                msg[0] = 0x02;
++                msg[1] = block;
++                msg[2] = phase;
++                memcpy(&msg[3], mc_get_ptr(block * 512 + phase * 128), 128);
++                mc_remote_send(mc_remote_dev, msg, 3 + 128);
++            }
++            printf("# %s: block %ld sent to the pad\n", __FUNCTION__, block);
++        }
++    }
++    if (mc_remote_lcd_pending) {
++        mc_remote_lcd_pending = 0;
++        msg[0] = 0x03;
++        memcpy(&msg[1], mc_remote_lcd_buf, 192);
++        mc_remote_send(mc_remote_dev, msg, 1 + 192);
++    }
++}
++
++/* ---------------- pages ---------------- */
++
++/* Writes every pending block of the current page in its file (timer task) */
++static void mc_flush_all(void) {
++    uint32_t state = mc_remote_state;
++    if (mc_remote_state != MC_REMOTE_ON && mc_remote_state != MC_REMOTE_PREP) {
++        mc_remote_state = MC_REMOTE_OFF;
++    }
++    for (uint32_t i = 0; i < MC_BUFFER_BLOCK_CNT && mc_block_state; i++) {
++        if (mc_store_spread() != 0) {
++            break;
++        }
++    }
++    if (mc_timer_hdl && esp_timer_is_active(mc_timer_hdl)) {
++        esp_timer_stop(mc_timer_hdl);
++    }
++    mc_remote_state = state;
++}
++
++/* Byte of the VMU image at file offset 'off' of a block; the buffer keeps the
++ * bus order, which may have each 32-bit word reversed: 'swap' selects it. */
++static inline uint8_t *mc_vb(uint8_t *blk, uint32_t off, uint32_t swap) {
++    return swap ? &blk[(off & ~3u) | (3 - (off & 3))] : &blk[off];
++}
++
++static inline uint32_t mc_vb16(uint8_t *blk, uint32_t off, uint32_t swap) {
++    return *mc_vb(blk, off, swap) | (*mc_vb(blk, off + 1, swap) << 8);
++}
++
++/* New page: an unformatted VMU (all zero). The Dreamcast BIOS formats it
++ * with its own official layout (homemade formatting confused openMenu). */
++static void mc_page_blank(void) {
++    for (uint32_t i = 0; i < MC_BUFFER_BLOCK_CNT; i++) {
++        memset(mc_buffer[i], 0, MC_BUFFER_BLOCK_SIZE);
++    }
++    printf("# %s: new unformatted page\n", __FUNCTION__);
++}
++
++/* VMU screen of the pad: "PAGE n", until the console draws the screen again */
++static void mc_page_show(void) {
++    static uint8_t msg[1 + 192];
++
++    if (!mc_remote_on || mc_remote_send == NULL) {
++        return;
++    }
++    (void)msg;
++    memcpy(mc_remote_lcd_buf, mc_page_lcd[mc_page % MC_PAGE_CNT], 192);
++    mc_remote_lcd_pending = 1;
++    mc_kick_fb();
++}
++
++static void mc_page_switch(int32_t step) {
++    uint32_t prev = mc_page;
++    uint32_t next = (mc_page + MC_PAGE_CNT + step) % MC_PAGE_CNT;
++    struct stat st;
++
++    if (mc_remote_state == MC_REMOTE_ON && mc_page == 0) {
++        uint32_t owed = 0;
++        for (uint32_t w = 0; w < 8; w++) {
++            owed |= mc_remote_ready[w];
++        }
++        if (owed) {
++            /* blocks still owed to the pad's VMU: let the feedback task send
++             * them first, then switch */
++            mc_kick_fb();
++            mc_page_req = step;
++            esp_timer_start_once(mc_remote_timer_hdl, 200000);
++            return;
++        }
++    }
++    mc_hidden = 1;          /* the console sees the VMU unplugged */
++    mc_flush_all();
++    if (mc_block_state) {
++        /* the current page could not be saved: stay on it, nothing is lost */
++        mc_fs_errors++;
++        printf("# %s: page %ld not saved, switch cancelled\n", __FUNCTION__, prev + 1);
++        mc_start_update_timer(1000000);
++        goto done;
++    }
++    if (stat(mc_page_file(next), &st) != 0) {
++        if (mc_fs_free() < MC_PAGE_MIN_FREE) {
++            mc_fs_errors++;
++            printf("# %s: not enough room for page %ld (%d free)\n", __FUNCTION__, next + 1, mc_fs_free());
++            goto done;
++        }
++        mc_page_blank();    /* template = page still in RAM */
++        mc_page = next;
++        if (mc_store() != 0) {
++            remove(mc_page_file(next));
++            mc_page = prev;
++            (void)mc_restore();
++            goto done;
++        }
++    }
++    else if (st.st_size != MC_BUFFER_SIZE) {
++        mc_fs_errors++;
++        printf("# %s: page %ld file damaged (%ld bytes)\n", __FUNCTION__, next + 1, st.st_size);
++        goto done;
++    }
++    else {
++        mc_page = next;
++        if (mc_restore() != 0) {
++            mc_page = prev;
++            (void)mc_restore();
++            goto done;
++        }
++    }
++    mc_block_state = 0;
++    memset(mc_remote_phases, 0, sizeof(mc_remote_phases));
++    memset(mc_remote_ready, 0, sizeof(mc_remote_ready));
++
++done:
++    printf("# %s: page %ld\n", __FUNCTION__, mc_page + 1);
++    mc_page_show();
++    mc_hidden = 0;
++}
++
++/* From the controller code: Start + Y / Start + X held. Done by the timer task. */
++void mc_page_step(int32_t step) {
++    if (mc_timer_hdl == NULL || mc_remote_timer_init() != 0) {
++        return;
++    }
++    if (mc_remote_state != MC_REMOTE_OFF && mc_remote_state != MC_REMOTE_ON) {
++        return;
++    }
++    if (esp_timer_is_active(mc_remote_timer_hdl) || mc_busy || mc_page_req) {
++        return;
++    }
++    mc_page_req = step;
++    esp_timer_start_once(mc_remote_timer_hdl, 1000);
++}
++
++uint32_t mc_page_get(void) {
++    return mc_page;
++}
+diff --git a/main/adapter/memory_card.h b/main/adapter/memory_card.h
+index ac1a3d6..cc16778 100644
+--- a/main/adapter/memory_card.h
++++ b/main/adapter/memory_card.h
+@@ -18,4 +18,19 @@ void mc_read(uint32_t addr, uint8_t *data, uint32_t size);
+ void mc_write(uint32_t addr, uint8_t *data, uint32_t size);
+ uint8_t *mc_get_ptr(uint32_t addr);
+ 
++/* Remote VMU: copy of the VMU plugged in a BluControl Dreamcast pad, received
++ * over BLE. While it is used, nothing is written to the internal VMU file. */
++extern volatile uint32_t mc_hidden;     /* 1 = no VMU shown to the console */
++extern volatile uint32_t mc_remote_on;  /* 1 = the console uses the pad's VMU */
++typedef void (*mc_remote_send_t)(int32_t dev_id, uint8_t *data, uint32_t len);
++int32_t mc_remote_begin(int32_t dev_id, mc_remote_send_t send, void (*req)(int32_t dev_id));
++/* pages (4 VMUs): step = +1 next, -1 previous */
++void mc_page_step(int32_t step);
++uint32_t mc_page_get(void);
++uint32_t mc_fs_used_pct(void);
++uint32_t mc_fs_err_get(void);
++void mc_remote_lcd(const uint8_t *data);
++void mc_remote_rx(const uint8_t *data, uint32_t len);
++void mc_remote_end(int32_t dev_id);
++
+ #endif /* _MEMORY_CARD_H_ */
+diff --git a/main/adapter/page_lcd.h b/main/adapter/page_lcd.h
+new file mode 100644
+index 0000000..8e3d2f7
+--- /dev/null
++++ b/main/adapter/page_lcd.h
+@@ -0,0 +1,8 @@
++/* Generated: "PAGE n" for the VMU screen, bus byte order (see gen.py) */
++static const uint8_t mc_page_lcd[5][192] = {
++    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE0, 0x07, 0xE0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE0, 0x01, 0xE0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x51, 0x76, 0x51, 0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x77, 0x35, 0x55, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x27, 0x76, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
++    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x1F, 0xF8, 0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x60, 0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE0, 0x07, 0xE0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x51, 0x76, 0x51, 0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x77, 0x35, 0x55, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x27, 0x76, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
++    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x07, 0xF8, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE0, 0x07, 0xE0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x07, 0xF8, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x51, 0x76, 0x51, 0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x77, 0x35, 0x55, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x27, 0x76, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
++    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x1F, 0xF8, 0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x06, 0x18, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x06, 0x18, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x60, 0x06, 0x60, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x07, 0x80, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x51, 0x76, 0x51, 0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x77, 0x35, 0x55, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x27, 0x76, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
++    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE0, 0x07, 0xE0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x07, 0xF8, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x1F, 0xF8, 0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x51, 0x76, 0x51, 0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x77, 0x35, 0x55, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x27, 0x76, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
++};
+diff --git a/main/adapter/wired/dc.c b/main/adapter/wired/dc.c
+index 37d7d3d..ca1a5fe 100644
+--- a/main/adapter/wired/dc.c
++++ b/main/adapter/wired/dc.c
+@@ -12,6 +12,8 @@
+ #include "tests/cmds.h"
+ #include "bluetooth/mon.h"
+ #include "dc.h"
++#include <esp_timer.h>
++#include "adapter/memory_card.h"
+ 
+ #define DC_TIMEOUT_TO_US 250000
+ #define DC_FREQ_TO_US 2000000
+@@ -189,7 +191,75 @@ static const uint8_t dc_kb_scancode[KBM_MAX] = {
+     0x00, 0x00, 0x00,
+ };
+ 
++/* VMU pages: Start + Y (next) / Start + X (previous) held 4 s on any controller.
++ * Many pads only send a report when something changes, so the 4 s are
++ * counted by a timer, not by the incoming reports. */
++#define DC_PAGE_HOLD_US (4 * 1000000)
++static esp_timer_handle_t dc_page_timer = NULL;
++static volatile int32_t dc_page_owner = -1;
++static volatile int32_t dc_page_dir = 0;
++static volatile uint32_t dc_page_fired = 0;
++volatile uint32_t dc_page_holds = 0;     /* diagnostic counters */
++volatile uint32_t dc_page_triggers = 0;
++
++static void dc_page_timer_cb(void *arg) {
++    if (dc_page_owner >= 0 && dc_page_dir != 0 && !dc_page_fired) {
++        dc_page_fired = 1;      /* once per hold */
++        dc_page_triggers++;
++        mc_page_step(dc_page_dir);
++    }
++}
++
++static void dc_page_combo(struct wired_ctrl *ctrl_data) {
++    int32_t idx = ctrl_data->index;
++    uint32_t btns = ctrl_data->btns[0].value;
++    int32_t step = 0;
++
++    if (dc_page_timer == NULL) {
++        const esp_timer_create_args_t args = {
++            .callback = &dc_page_timer_cb,
++            .arg = NULL,
++            .name = "dc_page"
++        };
++        if (esp_timer_create(&args, &dc_page_timer) != ESP_OK) {
++            dc_page_timer = NULL;
++            return;
++        }
++    }
++    if (btns & generic_btns_mask[PAD_MM]) {   /* PAD_MM = Dreamcast Start */
++        /* Start + Y = next page, Start + X = previous page (one of them only:
++         * Start + A + B + X + Y, the soft reset, is left alone) */
++        uint32_t x = btns & generic_btns_mask[PAD_RB_LEFT];
++        uint32_t y = btns & generic_btns_mask[PAD_RB_UP];
++        if (x && !y) {
++            step = -1;
++        }
++        else if (y && !x) {
++            step = 1;
++        }
++    }
++    if (step == 0) {
++        if (dc_page_owner == idx) {
++            esp_timer_stop(dc_page_timer);
++            dc_page_owner = -1;
++            dc_page_dir = 0;
++            dc_page_fired = 0;
++        }
++        return;
++    }
++    if (dc_page_owner == -1 || (dc_page_owner == idx && dc_page_dir != step)) {
++        esp_timer_stop(dc_page_timer);
++        dc_page_owner = idx;
++        dc_page_dir = step;
++        dc_page_fired = 0;
++        dc_page_holds++;
++        esp_timer_start_once(dc_page_timer, DC_PAGE_HOLD_US);
++    }
++}
++
+ static void dc_ctrl_special_action(struct wired_ctrl *ctrl_data, struct wired_data *wired_data) {
++    dc_page_combo(ctrl_data);
++
+     /* Output config mode toggle GamePad/GamePadAlt */
+     if (ctrl_data->map_mask[0] & generic_btns_mask[PAD_MT]) {
+         if (ctrl_data->btns[0].value & generic_btns_mask[PAD_MT]) {
+diff --git a/main/bluetooth/att_cfg.c b/main/bluetooth/att_cfg.c
+index 700ed48..c5b7394 100644
+--- a/main/bluetooth/att_cfg.c
++++ b/main/bluetooth/att_cfg.c
+@@ -4,6 +4,8 @@
+  */
+ 
+ #include <stdio.h>
++#include "driver/gpio.h"
++#include <esp_heap_caps.h>
+ #include <dirent.h>
+ #include <esp_ota_ops.h>
+ #include <esp_system.h>
+@@ -19,6 +21,7 @@
+ #include "adapter/gameid.h"
+ #include "system/manager.h"
+ #include "system/fs.h"
++#include "system/crashlog.h"
+ 
+ #define ATT_MAX_LEN 512
+ #define BR_ABI_VER 2
+@@ -309,7 +312,36 @@ static void bt_att_cfg_cmd_abi_ver_rsp(uint16_t handle) {
+ static void bt_att_cfg_cmd_fw_ver_rsp(uint16_t handle) {
+     const esp_app_desc_t *app_desc = esp_app_get_description();
+ 
++#ifdef CONFIG_BLUERETRO_SYSTEM_DC
++    /* diagnostic: live pin levels shown next to the version on blueretro.io
++     * p = VMU page, R = reason of the last reset (esp_reset_reason), F = file system used % */
++    {
++        /* version, reset reason, page, file system, then what the previous boot
++         * was doing when it ended (crash recorder, RTC memory) */
++        static char diag[160];
++        uint32_t len;
++        int n = snprintf(diag, sizeof(diag), "%.12s R%d p%lu F%lu", app_desc->version,
++            (int)esp_reset_reason() % 100, (unsigned long)(mc_page_get() + 1) % 10,
++            (unsigned long)mc_fs_used_pct() % 100);
++        if (n > 0 && n < (int)sizeof(diag)) {
++            crashlog_format(diag + n, sizeof(diag) - n);
++        }
++        len = strlen(diag);
++        if (len > (uint32_t)(mtu - 1)) {
++            len = mtu - 1;
++        }
++        if (len < 23) {
++            memset(diag + len, 0, 23 - len);
++            len = 23;
++        }
++        memcpy(bt_hci_pkt_tmp.att_data, diag, len);
++        printf("# %s %s\n", __FUNCTION__, diag);
++        bt_att_cmd(handle, BT_ATT_OP_READ_RSP, len);
++        return;
++    }
++#else
+     memcpy(bt_hci_pkt_tmp.att_data, app_desc->version, 23);
++#endif
+     bt_hci_pkt_tmp.att_data[23] = 0;
+     printf("# %s %s\n", __FUNCTION__, bt_hci_pkt_tmp.att_data);
+ 
+diff --git a/main/bluetooth/att_hid.c b/main/bluetooth/att_hid.c
+index 012fdbf..baa6a6b 100644
+--- a/main/bluetooth/att_hid.c
++++ b/main/bluetooth/att_hid.c
+@@ -15,6 +15,22 @@
+ #include "zephyr/gatt.h"
+ #include "adapter/hid_parser.h"
+ #include "adapter/mapping_quirks.h"
++#include "adapter/memory_card.h"
++
++/* BluControl Dreamcast pad: service that sends a copy of the VMU plugged in
++ * the pad. UUIDs 7d1e000X-5b3a-4c2e-9f61-0d7c5a9e3b20, little-endian;
++ * byte 12 = 1 service, 2 data (notify), 3 control (write). */
++static const uint8_t vmu_uuid_base[16] = {
++    0x20, 0x3b, 0x9e, 0x5a, 0x7c, 0x0d, 0x61, 0x9f,
++    0x2e, 0x4c, 0x3a, 0x5b, 0x01, 0x00, 0x1e, 0x7d,
++};
++
++static uint8_t vmu_uuid_kind(const uint8_t *uuid) {
++    if (memcmp(uuid, vmu_uuid_base, 12) || memcmp(uuid + 13, vmu_uuid_base + 13, 3)) {
++        return 0;
++    }
++    return uuid[12];
++}
+ 
+ enum {
+     BT_ATT_HID_DEVICE_NAME = 0,
+@@ -28,6 +44,8 @@ enum {
+     BT_ATT_HID_REPORT_CFG,
+     BT_ATT_HID_PPCP_CFG,
+     BT_ATT_HID_BATT_LVL,
++    BT_ATT_HID_VMU_HDLS,
++    BT_ATT_HID_VMU_CFG,
+     BT_ATT_HID_INIT,
+     BT_ATT_HID_STATE_MAX,
+ };
+@@ -70,6 +88,13 @@ struct bt_att_hid {
+     uint8_t report_found;
+     uint8_t report_idx;
+     struct bt_att_hid_report reports[HID_MAX_REPORT];
++    uint16_t vmu_start_hdl;
++    uint16_t vmu_end_hdl;
++    uint16_t vmu_data_hdl;
++    uint16_t vmu_cfg_hdl;
++    uint16_t vmu_ctrl_hdl;
++    uint8_t vmu_last;
++    uint8_t vmu_ok;
+ };
+ 
+ typedef void (*bit_att_hid_start_func_t)(struct bt_dev *device,
+@@ -170,6 +195,17 @@ static void bt_att_hid_process_find_hid_hdls(struct bt_dev *device,
+                 }
+             }
+         }
++        else if (data_len == 20) {
++            for (uint32_t i = 0; i < elem_cnt; i++) {
++                struct bt_att_group_data *elem128 = (struct bt_att_group_data *)((uint8_t *)data + data_len * i);
++                if (vmu_uuid_kind(elem128->value) == 0x01) {
++                    hid_data->vmu_start_hdl = elem128->start_handle;
++                    hid_data->vmu_end_hdl = elem128->end_handle;
++                    printf("# dev: %ld BluControl VMU service %04X-%04X\n", device->ids.id,
++                        elem128->start_handle, elem128->end_handle);
++                }
++            }
++        }
+         struct bt_att_group_data *last_elem = (struct bt_att_group_data *)((uint8_t *)data + data_len * (elem_cnt - 1));
+         bt_att_cmd_read_group_req_uuid16(device->acl_handle, last_elem->end_handle, BT_UUID_GATT_PRIMARY);
+     }
+@@ -417,11 +453,113 @@ static void bt_att_hid_process_batt_lvl(struct bt_dev *device,
+     bt_att_hid_start_next_state(device, hid_data);
+ }
+ 
++static void bt_att_hid_start_vmu_hdls(struct bt_dev *device,
++        struct bt_att_hid *hid_data) {
++#ifdef CONFIG_BLUERETRO_SYSTEM_DC
++    if (hid_data->vmu_start_hdl && hid_data->vmu_end_hdl > hid_data->vmu_start_hdl) {
++        bt_att_cmd_find_info_req(device->acl_handle, hid_data->vmu_start_hdl, hid_data->vmu_end_hdl);
++        return;
++    }
++#endif
++    bt_att_hid_start_next_state(device, hid_data);
++}
++
++static void bt_att_hid_process_vmu_hdls(struct bt_dev *device,
++        struct bt_att_hid *hid_data, uint32_t att_len, uint8_t *info, uint32_t format) {
++    if (info) {
++        uint16_t last_handle = 0;
++        uint32_t elem_cnt;
++
++        if (format == BT_ATT_INFO_16) {
++            struct bt_att_info_16 *info16 = (struct bt_att_info_16 *)info;
++            elem_cnt = (att_len - 2) / sizeof(*info16);
++            for (uint32_t i = 0; i < elem_cnt; i++) {
++                last_handle = info16[i].handle;
++                if (info16[i].uuid == BT_UUID_GATT_CHRC) {
++                    hid_data->vmu_last = 0;
++                }
++                else if (info16[i].uuid == BT_UUID_GATT_CCC && hid_data->vmu_last == 0x02) {
++                    hid_data->vmu_cfg_hdl = info16[i].handle;
++                }
++            }
++        }
++        else {
++            struct bt_att_info_128 *info128 = (struct bt_att_info_128 *)info;
++            elem_cnt = (att_len - 2) / sizeof(*info128);
++            for (uint32_t i = 0; i < elem_cnt; i++) {
++                uint8_t kind = vmu_uuid_kind(info128[i].uuid);
++                last_handle = info128[i].handle;
++                if (kind == 0x02) {
++                    hid_data->vmu_data_hdl = info128[i].handle;
++                }
++                else if (kind == 0x03) {
++                    hid_data->vmu_ctrl_hdl = info128[i].handle;
++                }
++                hid_data->vmu_last = kind;
++            }
++        }
++
++        if (elem_cnt && last_handle < hid_data->vmu_end_hdl) {
++            bt_att_cmd_find_info_req(device->acl_handle, last_handle + 1, hid_data->vmu_end_hdl);
++            return;
++        }
++    }
++    printf("# dev: %ld VMU hdl data: %04X cfg: %04X ctrl: %04X\n", device->ids.id,
++        hid_data->vmu_data_hdl, hid_data->vmu_cfg_hdl, hid_data->vmu_ctrl_hdl);
++    bt_att_hid_start_next_state(device, hid_data);
++}
++
++static void bt_att_hid_start_vmu_cfg(struct bt_dev *device,
++        struct bt_att_hid *hid_data) {
++    if (hid_data->vmu_data_hdl && hid_data->vmu_cfg_hdl && hid_data->vmu_ctrl_hdl) {
++        uint16_t data = BT_GATT_CCC_NOTIFY;
++        bt_att_cmd_write_req(device->acl_handle, hid_data->vmu_cfg_hdl, (uint8_t *)&data, sizeof(data));
++        return;
++    }
++    bt_att_hid_start_next_state(device, hid_data);
++}
++
++/* Only reached on an error response: no VMU copy for this pad */
++static void bt_att_hid_process_vmu_cfg(struct bt_dev *device,
++        struct bt_att_hid *hid_data, uint32_t att_len, uint8_t *data, uint32_t data_len) {
++    hid_data->vmu_ok = 0;
++    bt_att_hid_start_next_state(device, hid_data);
++}
++
++#ifdef CONFIG_BLUERETRO_SYSTEM_DC
++/* VMU write-back and screen to the BluControl pad (ATT write command) */
++static void bt_att_vmu_send(int32_t dev_id, uint8_t *data, uint32_t len) {
++    struct bt_dev *device = NULL;
++    struct bt_att_hid *hid_data;
++
++    if (dev_id < 0 || dev_id >= BT_MAX_DEV) {
++        return;
++    }
++    hid_data = &att_hid[dev_id];
++    bt_host_get_dev_from_id(dev_id, &device);
++    if (device == NULL || !hid_data->vmu_ctrl_hdl || len + 3 > device->mtu) {
++        return;
++    }
++    bt_att_cmd_write_cmd(device->acl_handle, hid_data->vmu_ctrl_hdl, data, len);
++}
++
++static void bt_att_vmu_request(int32_t dev_id) {
++    uint8_t req = 0x01;     /* send me your VMU */
++    bt_att_vmu_send(dev_id, &req, sizeof(req));
++}
++#endif
++
+ static void bt_att_hid_start_init(struct bt_dev *device,
+         struct bt_att_hid *hid_data) {
+     if (!atomic_test_bit(&device->flags, BT_DEV_HID_INTR_READY)) {
+         atomic_set_bit(&device->flags, BT_DEV_HID_INTR_READY);
+         bt_hid_init(device);
++#ifdef CONFIG_BLUERETRO_SYSTEM_DC
++        if (hid_data->vmu_ok) {
++            /* the request (send me your VMU) goes out once page 1 is ready */
++            (void)mc_remote_begin(device->ids.id, bt_att_vmu_send, bt_att_vmu_request);
++        }
++#endif
+     }
+ }
+ 
+@@ -437,6 +575,8 @@ static bit_att_hid_start_func_t start_state_func[BT_ATT_HID_STATE_MAX] = {
+     bt_att_hid_start_report_cfg,
+     bt_att_hid_start_ppcp_cfg,
+     bt_att_hid_start_batt_lvl,
++    bt_att_hid_start_vmu_hdls,
++    bt_att_hid_start_vmu_cfg,
+     bt_att_hid_start_init, /* Need to be last one */
+ };
+ static bit_att_hid_process_func_t process_state_func[BT_ATT_HID_STATE_MAX] = {
+@@ -451,6 +591,8 @@ static bit_att_hid_process_func_t process_state_func[BT_ATT_HID_STATE_MAX] = {
+     bt_att_hid_continue_report_cfg,
+     bt_att_hid_process_ppcp_cfg,
+     bt_att_hid_process_batt_lvl,
++    (bit_att_hid_process_func_t)bt_att_hid_process_vmu_hdls,
++    bt_att_hid_process_vmu_cfg,
+     NULL, /* Need to be last one */
+ };
+ 
+@@ -542,6 +684,9 @@ void bt_att_hid_hdlr(struct bt_dev *device, struct bt_hci_pkt *bt_hci_acl_pkt, u
+                     case BT_ATT_HID_IDENT_HID_HLDS:
+                         bt_att_hid_process_ident_hid_hdls(device, hid_data, att_len, find_info_rsp->info, find_info_rsp->format);
+                         break;
++                    case BT_ATT_HID_VMU_HDLS:
++                        bt_att_hid_process_vmu_hdls(device, hid_data, att_len, find_info_rsp->info, find_info_rsp->format);
++                        break;
+                     default:
+                         printf("# %s: Invalid state: %ld rsp: 0x%02X\n", __FUNCTION__, device->hid_state, bt_hci_acl_pkt->att_hdr.code);
+                         break;
+@@ -651,6 +796,10 @@ void bt_att_hid_hdlr(struct bt_dev *device, struct bt_hci_pkt *bt_hci_acl_pkt, u
+                     case BT_ATT_HID_REPORT_CFG:
+                         bt_att_hid_continue_report_cfg(device, hid_data, att_len, NULL, 0);
+                         break;
++                    case BT_ATT_HID_VMU_CFG:
++                        hid_data->vmu_ok = 1;
++                        bt_att_hid_start_next_state(device, hid_data);
++                        break;
+                     default:
+                         printf("# %s: Invalid state: %ld rsp: 0x%02X\n", __FUNCTION__, device->hid_state, bt_hci_acl_pkt->att_hdr.code);
+                         break;
+@@ -662,6 +811,15 @@ void bt_att_hid_hdlr(struct bt_dev *device, struct bt_hci_pkt *bt_hci_acl_pkt, u
+         {
+             struct bt_att_notify *notify = (struct bt_att_notify *)bt_hci_acl_pkt->att_data;
+ 
++#ifdef CONFIG_BLUERETRO_SYSTEM_DC
++            if (hid_data->vmu_data_hdl && notify->handle == hid_data->vmu_data_hdl) {
++                /* att_len counts the opcode and the handle */
++                if (att_len > 3) {
++                    mc_remote_rx(notify->value, att_len - 3);
++                }
++                break;
++            }
++#endif
+             for (uint32_t i = 0; i < HID_MAX_REPORT; i++) {
+                 if (notify->handle == hid_data->reports[i].report_hdl) {
+ #ifdef CONFIG_BLUERETRO_ADAPTER_RUMBLE_TEST
+diff --git a/main/bluetooth/host.c b/main/bluetooth/host.c
+index 2e81290..b3b2d01 100644
+--- a/main/bluetooth/host.c
++++ b/main/bluetooth/host.c
+@@ -29,6 +29,7 @@
+ #include "adapter/config.h"
+ #include "adapter/gameid.h"
+ #include "adapter/memory_card.h"
++#include "system/crashlog.h"
+ #include "adapter/wired/wired.h"
+ #include "adapter/hid_parser.h"
+ #include "bluetooth/hidp/ps.h"
+@@ -532,6 +533,10 @@ void bt_host_reset_dev(struct bt_dev *device) {
+     return;
+ 
+ reset_dev:
++#ifdef CONFIG_BLUERETRO_SYSTEM_DC
++    crashlog_disc();
++    mc_remote_end(dev_id);
++#endif
+     adapter_init_buffer(dev_id);
+     memset(bt_adapter.data[dev_id].raw_src_mappings, 0, sizeof(*bt_adapter.data[0].raw_src_mappings) * REPORT_MAX);
+     memset(bt_adapter.data[dev_id].reports, 0, sizeof(bt_adapter.data[0].reports));
+diff --git a/main/main.c b/main/main.c
+index 041d4f8..49b912a 100644
+--- a/main/main.c
++++ b/main/main.c
+@@ -13,6 +13,7 @@
+ #include <esp_efuse.h>
+ #include "system/bare_metal_app_cpu.h"
+ #include "system/core0_stall.h"
++#include "system/crashlog.h"
+ #include "system/delay.h"
+ #include "system/fs.h"
+ #include "system/led.h"
+@@ -150,6 +151,7 @@ static void wl_init_task(void *arg) {
+ 
+ void app_main()
+ {
++    crashlog_init();
+     adapter_init();
+ 
+     start_app_cpu(wired_init_task);
+diff --git a/main/system/crashlog.c b/main/system/crashlog.c
+new file mode 100644
+index 0000000..eed17cf
+--- /dev/null
++++ b/main/system/crashlog.c
+@@ -0,0 +1,140 @@
++/*
++ * Crash recorder for the Dreamcast VMU build.
++ *  - tick hook (IRAM, runs even during flash access): longest run of one task,
++ *    longest run with the scheduler suspended, with the VMU breadcrumb;
++ *  - task watchdog alarm: task that was running;
++ *  - software crash: PC, return address and exception cause.
++ * Kept in RTC memory (survives every reset except power off), the previous
++ * boot's record is shown on blueretro.io next to the version.
++ */
++#include <stdio.h>
++#include <string.h>
++#include <esp_attr.h>
++#include <esp_freertos_hooks.h>
++#include <esp_system.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++#include <xtensa_context.h>
++#include "esp_private/panic_internal.h"
++#include "crashlog.h"
++
++#define CL_MAGIC 0xB10C0DE5
++
++RTC_NOINIT_ATTR crashlog_t cl_live;
++static crashlog_t cl_prev;
++static uint32_t cl_prev_valid = 0;
++
++static DRAM_ATTR const char cl_isr[] = "isr";
++static DRAM_ATTR TaskHandle_t cl_idle = NULL;
++static DRAM_ATTR TaskHandle_t cl_last = NULL;
++static DRAM_ATTR uint32_t cl_same = 0;
++static DRAM_ATTR uint32_t cl_susp = 0;
++
++static inline void IRAM_ATTR cl_name(char *dst, TaskHandle_t task) {
++    const char *name = task ? pcTaskGetName(task) : cl_isr;
++    uint32_t i;
++    for (i = 0; i < 7 && name[i]; i++) {
++        dst[i] = name[i];
++    }
++    dst[i] = 0;
++}
++
++static void IRAM_ATTR cl_tick(void) {
++    TaskHandle_t cur = xTaskGetCurrentTaskHandle();
++
++    cl_live.ticks++;
++    if (xTaskGetSchedulerState() == taskSCHEDULER_SUSPENDED) {
++        cl_susp++;
++        if (cl_susp > cl_live.susp_ticks) {
++            cl_live.susp_ticks = cl_susp;
++            cl_live.susp_step = cl_live.step;
++            cl_name(cl_live.susp_name, cur);
++        }
++    }
++    else {
++        cl_susp = 0;
++    }
++    cl_live.cur_susp = cl_susp;
++    if (cur == cl_last && cur != cl_idle) {
++        cl_same++;
++        if (cl_same > cl_live.hog_ticks) {
++            cl_live.hog_ticks = cl_same;
++            cl_live.hog_step = cl_live.step;
++            cl_name(cl_live.hog_name, cur);
++        }
++    }
++    else {
++        cl_same = 0;
++        cl_last = cur;
++        cl_name(cl_live.cur_name, cur);
++    }
++    cl_live.cur_same = cl_same;
++}
++
++/* called by the task watchdog interrupt (IDF weak hook) */
++void esp_task_wdt_isr_user_handler(void) {
++    cl_live.twdt++;
++    cl_live.twdt_step = cl_live.step;
++    cl_name(cl_live.twdt_name, xTaskGetCurrentTaskHandle());
++}
++
++/* software crash: linked with -Wl,--wrap=esp_panic_handler */
++void __real_esp_panic_handler(panic_info_t *info);
++void IRAM_ATTR __wrap_esp_panic_handler(panic_info_t *info) {
++    if (cl_live.magic == CL_MAGIC && !cl_live.panic) {
++        const XtExcFrame *frame = (const XtExcFrame *)info->frame;
++        cl_live.panic = 1;
++        cl_live.panic_pc = (uint32_t)info->addr;
++        cl_live.panic_step = cl_live.step;
++        if (frame) {
++            cl_live.panic_a0 = frame->a0;
++            cl_live.panic_cause = info->pseudo_excause ? (100 + frame->exccause) : frame->exccause;
++        }
++    }
++    __real_esp_panic_handler(info);
++}
++
++void IRAM_ATTR crashlog_written(void) {
++    cl_live.writes++;
++}
++
++void crashlog_disc(void) {
++    cl_live.disc_ticks = cl_live.ticks;
++    cl_live.disc_cnt++;
++}
++
++void crashlog_init(void) {
++    if (cl_live.magic == CL_MAGIC) {
++        memcpy(&cl_prev, &cl_live, sizeof(cl_prev));
++        cl_prev_valid = 1;
++    }
++    memset(&cl_live, 0, sizeof(cl_live));
++    cl_live.magic = CL_MAGIC;
++    cl_idle = xTaskGetIdleTaskHandleForCore(0);
++    esp_register_freertos_tick_hook_for_cpu(cl_tick, 0);
++}
++
++/* previous boot, e.g. "t312 s22 w4 d300/2 H45mc_task Z12s22 W1:BTC_TAS P400d1234/800d5678c28" */
++int crashlog_format(char *buf, uint32_t size) {
++    int len;
++    const crashlog_t *c = &cl_prev;
++
++    if (!cl_prev_valid) {
++        return snprintf(buf, size, " nolog");
++    }
++    len = snprintf(buf, size, " t%lu s%lu w%lu d%lu/%lu H%lu%s@%lu Z%lu%s@%lu",
++        c->ticks / 100, c->step, c->writes, c->disc_ticks / 100, c->disc_cnt,
++        c->hog_ticks, c->hog_name, c->hog_step,
++        c->susp_ticks, c->susp_name, c->susp_step);
++    if (len > 0 && len < (int)size) {
++        len += snprintf(buf + len, size - len, " C%lu/%lu%s", c->cur_same, c->cur_susp, c->cur_name);
++    }
++    if (c->twdt && len > 0 && len < (int)size) {
++        len += snprintf(buf + len, size - len, " W%lu%s@%lu", c->twdt, c->twdt_name, c->twdt_step);
++    }
++    if (c->panic && len > 0 && len < (int)size) {
++        len += snprintf(buf + len, size - len, " P%08lx/%08lxc%lu@%lu",
++            c->panic_pc, c->panic_a0, c->panic_cause, c->panic_step);
++    }
++    return len;
++}
+diff --git a/main/system/crashlog.h b/main/system/crashlog.h
+new file mode 100644
+index 0000000..1a7320c
+--- /dev/null
++++ b/main/system/crashlog.h
+@@ -0,0 +1,47 @@
++/*
++ * Crash recorder for the Dreamcast VMU build: what the ESP32 was doing when it
++ * reset, kept in RTC memory across the reset and shown on blueretro.io.
++ */
++#ifndef _CRASHLOG_H_
++#define _CRASHLOG_H_
++
++#include <stdint.h>
++
++typedef struct {
++    uint32_t magic;
++    volatile uint32_t step;       /* breadcrumb of the VMU file code */
++    uint32_t writes;              /* 4 KB blocks written to the files */
++    uint32_t ticks;               /* uptime, 10 ms ticks */
++    uint32_t hog_ticks;           /* longest run of one non-idle task on core 0 */
++    uint32_t hog_step;
++    char hog_name[8];
++    uint32_t susp_ticks;          /* longest run with the scheduler suspended (flash access) */
++    uint32_t susp_step;
++    char susp_name[8];
++    uint32_t twdt;                /* task watchdog alarms */
++    uint32_t twdt_step;
++    char twdt_name[8];
++    uint32_t panic;               /* 1 = software crash recorded */
++    uint32_t panic_pc;
++    uint32_t panic_a0;
++    uint32_t panic_cause;
++    uint32_t panic_step;
++    uint32_t disc_ticks;          /* uptime of the last Bluetooth disconnection */
++    uint32_t disc_cnt;
++    uint32_t cur_same;            /* at the last tick: current run of the running task */
++    uint32_t cur_susp;            /* at the last tick: current run with the scheduler suspended */
++    char cur_name[8];             /* at the last tick: running task */
++} crashlog_t;
++
++extern crashlog_t cl_live;
++
++static inline void crashlog_step(uint32_t step) {
++    cl_live.step = step;
++}
++
++void crashlog_init(void);
++void crashlog_written(void);
++void crashlog_disc(void);
++int crashlog_format(char *buf, uint32_t size);
++
++#endif /* _CRASHLOG_H_ */
+diff --git a/main/system/manager.c b/main/system/manager.c
+index 96f5f53..cdd1404 100644
+--- a/main/system/manager.c
++++ b/main/system/manager.c
+@@ -507,7 +507,9 @@ static void sys_mgr_power_off(void) {
+ }
+ 
+ static int32_t sys_mgr_get_power(void) {
+-#ifdef CONFIG_BLUERETRO_SYSTEM_UNIVERSAL
++#if defined(CONFIG_BLUERETRO_SYSTEM_UNIVERSAL) || defined(CONFIG_BLUERETRO_SYSTEM_DC)
++    /* DC internal install: the ESP32 is only powered while the console is on,
++     * so IO39 (power sense) is not needed; a floating IO39 kicks every BT pad */
+     return 1;
+ #else
+     if (hw_config.external_adapter) {
+diff --git a/main/wired/maple.c b/main/wired/maple.c
+index 85c3bc0..619a9ae 100644
+--- a/main/wired/maple.c
++++ b/main/wired/maple.c
+@@ -449,7 +449,7 @@ maple_end:
+                         if (config.out_cfg[port].acc_mode & ACC_RUMBLE) {
+                             pkt.src |= ADDR_RUMBLE;
+                         }
+-                        if (config.out_cfg[port].acc_mode & ACC_MEM) {
++                        if ((config.out_cfg[port].acc_mode & ACC_MEM) && !mc_hidden) {
+                             pkt.src |= ADDR_MEM;
+                         }
+                         pkt.dst = dst;
+@@ -560,10 +560,19 @@ maple_end:
+                             case CMD_INFO_REQ:
+                                 pkt.len = 28;
+                                 pkt.cmd = CMD_INFO_RSP;
+-                                pkt.data32[0] = ID_VMU_MEM;
+-                                pkt.data32[1] = DESC_VMU_MEMORY;
+-                                pkt.data32[2] = 0;
+-                                pkt.data32[3] = 0;
++                                if (mc_remote_on) {
++                                    /* pad VMU: screen forwarded to the pad (same answer as BlueRetro upstream) */
++                                    pkt.data32[0] = ID_VMU_CLK | ID_VMU_LCD | ID_VMU_MEM;
++                                    pkt.data32[1] = DESC_VMU_TIMER;
++                                    pkt.data32[2] = DESC_VMU_SCREEN;
++                                    pkt.data32[3] = DESC_VMU_MEMORY;
++                                }
++                                else {
++                                    pkt.data32[0] = ID_VMU_MEM;
++                                    pkt.data32[1] = DESC_VMU_MEMORY;
++                                    pkt.data32[2] = 0;
++                                    pkt.data32[3] = 0;
++                                }
+                                 memcpy((void *)&pkt.data32[4], vmu_area_dir_name, sizeof(vmu_area_dir_name));
+                                 memcpy((void *)&pkt.data32[12], brand, sizeof(brand));
+                                 pkt.data32[27] = PWR_VMU;
+@@ -572,6 +581,17 @@ maple_end:
+                             case CMD_EXT_INFO_REQ: /* unimplemented */
+                             case CMD_GET_CONDITION:
+                             case CMD_MEM_INFO_REQ:
++                                if (pkt.data32[0] == ID_VMU_LCD) {
++                                    /* same answer as BlueRetro upstream */
++                                    pkt.len = 0x02;
++                                    pkt.cmd = CMD_DATA_TX;
++                                    pkt.data32[1] = 0x2F1F1002;
++                                    maple_tx(port, maple0, maple1, pkt.data, pkt.len * 4 + 5);
++                                    break;
++                                }
++                                if (pkt.data32[0] == ID_VMU_CLK) {
++                                    break;  /* no answer, like BlueRetro upstream */
++                                }
+                                 pkt.len = 0x07;
+                                 pkt.cmd = CMD_DATA_TX;
+                                 pkt.data32[0] = ID_VMU_MEM;
+@@ -591,6 +611,15 @@ maple_end:
+                                 maple_tx(port, maple0, maple1, pkt.data, pkt.len * 4 + 5);
+                                 break;
+                             case CMD_BLOCK_WRITE:
++                                if (pkt.data32[0] == ID_VMU_LCD) {
++                                    if ((!bad_frame) && pkt.len == (48 + 2)) {
++                                        mc_remote_lcd((void *)&pkt.data32[2]);
++                                    }
++                                    pkt.len = 0x00;
++                                    pkt.cmd = CMD_ACK;
++                                    maple_tx(port, maple0, maple1, pkt.data, pkt.len * 4 + 5);
++                                    break;
++                                }
+                                 if (pkt.len != (32 + 2)) {
+                                     ets_printf("Unexpected Block Write packet length: 0x%02X, expected 0x22\n", pkt.len);
+                                 }
