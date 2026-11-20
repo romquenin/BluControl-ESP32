@@ -4,4 +4,22 @@ menu "BluControl OTA Configuration"
         default -1
         help
             GPIO Number for the LED which will be blinking while on OTA mode. -1 for none.
+    config BLUCONTROL_OTA_LED_ACTIVE_LOW
+        bool "OTA LED lights on LOW level"
+        default n
+    config BLUCONTROL_OTA_POWER_BUTTON_GPIO
+        int "Power button GPIO (software energy mode)"
+        default -1
+        help
+            For controllers without a power switch: holding this button
+            BLUCONTROL_OTA_POWER_OFF_MS leaves OTA mode and puts the controller to deep
+            sleep (it wakes up on this button). Must be an RTC GPIO. -1 for none.
+    config BLUCONTROL_OTA_POWER_OFF_MS
+        int "Hold time to leave OTA mode and power off (ms)"
+        default 5000
+        depends on BLUCONTROL_OTA_POWER_BUTTON_GPIO >= 0
+    config BLUCONTROL_OTA_TIMEOUT_MIN
+        int "Leave OTA mode and power off after this many minutes (0 = never)"
+        default 15
+        depends on BLUCONTROL_OTA_POWER_BUTTON_GPIO >= 0
 endmenu

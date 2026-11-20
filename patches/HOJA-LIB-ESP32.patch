@@ -1,0 +1,59 @@
+diff --git a/cores/switch/core_switch_comms.c b/cores/switch/core_switch_comms.c
+index ccf6b6d..3186fa8 100644
+--- a/cores/switch/core_switch_comms.c
++++ b/cores/switch/core_switch_comms.c
+@@ -33,7 +33,9 @@ void ns_comms_handle_command(uint8_t report_id, uint16_t len, uint8_t* p_data)
+             // Set input report ID
+             ns_report_setid(NS_REPORT_SUBCMD);
+ 
+-            // TODO parse rumble data
++            // Rumble data is also carried by sub-command packets
++            switch_vibration_parse(p_data);
++            switch_vibration_handle();
+ 
+             // Pass off to the sub-command handler.
+             ns_comms_handle_subcommand(p_data[9], len, p_data);
+diff --git a/cores/switch/core_switch_vibration.c b/cores/switch/core_switch_vibration.c
+index 3b2f4d4..41ce37f 100644
+--- a/cores/switch/core_switch_vibration.c
++++ b/cores/switch/core_switch_vibration.c
+@@ -1,9 +1,37 @@
+ #include "core_switch_vibration.h"
+ 
++/*
++ * Switch HD rumble: 4 bytes per side.
++ *   byte0 + bit0 of byte1            : high-band frequency
++ *   byte1 bits 1..7                  : high-band amplitude code (0..100)
++ *   byte2 bits 0..6                  : low-band frequency
++ *   (byte3 - 0x40) << 1 | byte2 bit7 : low-band amplitude code (0..100)
++ * The neutral / off frame is 00 01 40 40.
++ * An ERM motor cannot reproduce frequencies, so keep the strongest band's
++ * amplitude, scaled to 0..255. (The previous code used byte0, a frequency
++ * byte, so the motor state did not follow the amplitude.)
++ */
++static uint8_t hd_rumble_amplitude(const uint8_t *r)
++{
++    uint32_t hf = r[1] >> 1;
++    uint32_t lf = 0;
++    if (r[3] >= 0x40)
++    {
++        lf = ((uint32_t)(r[3] - 0x40) << 1) | (r[2] >> 7);
++    }
++    uint32_t amp = hf > lf ? hf : lf;
++    if (amp > 100)
++    {
++        amp = 100;
++    }
++    return (uint8_t)(amp * 255 / 100);
++}
++
+ void switch_vibration_parse(uint8_t* p_data)
+ {
+-    hoja_rumble_data.left_rumble = p_data[1];
+-    hoja_rumble_data.right_rumble = p_data[5];
++    /* p_data[0] is the packet counter, then 4 bytes left, 4 bytes right */
++    hoja_rumble_data.left_rumble = hd_rumble_amplitude(&p_data[1]);
++    hoja_rumble_data.right_rumble = hd_rumble_amplitude(&p_data[5]);
+ }
+ 
+ void switch_vibration_handle(void)

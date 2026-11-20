@@ -42,3 +42,7 @@ sdkconfig.old
 sdkconfig
 tmp/
 tmp*.txt
+
+# local builds
+release/
+build_*/

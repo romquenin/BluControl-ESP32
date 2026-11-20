@@ -57,5 +57,7 @@ void blu_energy_init();
 bool blu_energy_is_clock_running();
 void blu_energy_start_clock();
 void blu_energy_stop_clock();
+/* Software energy mode: blink, then deep sleep until the power button is pressed */
+void blu_energy_power_off(void);
 
 #endif

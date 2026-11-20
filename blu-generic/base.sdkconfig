@@ -378,7 +378,7 @@ CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
 CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
 CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
-# CONFIG_BT_NIMBLE_NVS_PERSIST is not set
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
 CONFIG_BT_NIMBLE_SECURITY_ENABLE=y
 CONFIG_BT_NIMBLE_SM_LEGACY=y
 CONFIG_BT_NIMBLE_SM_SC=y
@@ -1594,11 +1594,69 @@ CONFIG_WPA_MBEDTLS_TLS_CLIENT=y
 # end of Supplicant
 
 #
+# BluControl Generic Configuration
+#
+
+#
+# Buttons
+#
+# end of Buttons
+
+#
+# Triggers
+#
+# end of Triggers
+# end of BluControl Generic Configuration
+
+#
+# BluControl Configuration
+#
+
+#
+# Buttons
+#
+# end of Buttons
+
+#
+# Triggers
+#
+# end of Triggers
+
+#
+# Sticks
+#
+
+#
+# Left Stick
+#
+# end of Left Stick
+
+#
+# Right stick
+#
+# end of Right stick
+# end of Sticks
+
+#
+# Rumble
+#
+# end of Rumble
+
+#
+# Energy control
+#
+# end of Energy control
+
+#
 # Advanced
 #
-CONFIG_BLUCONTROL_ANALOG_VREF=1079
 # end of Advanced
 # end of BluControl Configuration
+
+#
+# BluControl SDK Configuration
+#
+# end of BluControl SDK Configuration
 
 #
 # ESP-NimBLE-CPP configuration
@@ -1670,7 +1728,7 @@ CONFIG_NIMBLE_ROLE_CENTRAL=y
 CONFIG_NIMBLE_ROLE_PERIPHERAL=y
 CONFIG_NIMBLE_ROLE_BROADCASTER=y
 CONFIG_NIMBLE_ROLE_OBSERVER=y
-# CONFIG_NIMBLE_NVS_PERSIST is not set
+CONFIG_NIMBLE_NVS_PERSIST=y
 CONFIG_NIMBLE_SM_LEGACY=y
 CONFIG_NIMBLE_SM_SC=y
 # CONFIG_NIMBLE_SM_SC_DEBUG_KEYS is not set

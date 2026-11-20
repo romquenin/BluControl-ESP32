@@ -4,6 +4,7 @@
 #include "blucontrol_mode.h"
 #include "blu-energy.h"
 #include "blu-hardware.h"
+#include "blu-rumble.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"

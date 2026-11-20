@@ -1,4 +1,5 @@
 #include "blu-hardware.h"
+#include "blu-rumble.h"
 
 #if defined(CONFIG_BLUCONTROL_LEFT_STICK_ANALOG) || defined(CONFIG_BLUCONTROL_RIGHT_STICK_ANALOG)
     #include "blu-analog-pad.h"
@@ -164,7 +165,7 @@ void prepare_buttons_gpio()
         buttons_ref[i]->gpios = malloc(sizeof(uint8_t) * gpioLength);
 
         int o = 0;
-        tmpStr = malloc(strlen(buttons_gpio[i]));
+        tmpStr = malloc(strLength + 1);  /* +1: room for the terminating NUL (was a 1-byte heap overflow) */
         strcpy(tmpStr, buttons_gpio[i]);
         spaceStr = strtok(tmpStr, " ");
         while (spaceStr != NULL)
@@ -200,19 +201,12 @@ void prepare_buttons_gpio()
             spaceStr = strtok(NULL, " ");
             o++;
         }
+        free(tmpStr);
     }
 }
 
 void prepare_rumbles_gpio()
 {
-    #if defined(CONFIG_BLUCONTROL_RUMBLE_LEFT_GPIO) && CONFIG_BLUCONTROL_RUMBLE_LEFT_GPIO >= 0
-    gpio_reset_pin(CONFIG_BLUCONTROL_RUMBLE_LEFT_GPIO);
-    gpio_set_direction(CONFIG_BLUCONTROL_RUMBLE_LEFT_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(CONFIG_BLUCONTROL_RUMBLE_LEFT_GPIO, 0);
-    #endif
-    #if defined(CONFIG_BLUCONTROL_RUMBLE_RIGHT_GPIO) && CONFIG_BLUCONTROL_RUMBLE_RIGHT_GPIO >= 0
-    gpio_reset_pin(CONFIG_BLUCONTROL_RUMBLE_RIGHT_GPIO);
-    gpio_set_direction(CONFIG_BLUCONTROL_RUMBLE_RIGHT_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(CONFIG_BLUCONTROL_RUMBLE_RIGHT_GPIO, 0);
-    #endif
+    /* PWM (LEDC) motor driver, motor off at start-up */
+    blu_rumble_init();
 }

@@ -479,6 +479,26 @@ menu "BluControl Configuration"
             default -1
             help
                 GPIO Number for the right side rumble motor. -1 if not present.
+        config BLUCONTROL_BLE_NEW_ADDRESS_EACH_BOOT
+            bool "BlueRetro mode: new Bluetooth address at every power-on"
+            default n
+            help
+                The controller shows up as a brand new device at every power-on, so the
+                host always does a fresh pairing instead of a reconnection. Works around
+                hosts that pair the first time but never reconnect.
+        config BLUCONTROL_RUMBLE_MIN_POWER
+            int "Minimum motor power (0-255)"
+            default 0
+            range 0 255
+            help
+                Any non-zero rumble request below this value is raised to it, so weak
+                requests still make a small ERM motor spin. 0 keeps requests unchanged.
+        config BLUCONTROL_RUMBLE_MAX_ON_MS
+            int "Safety: max continuous rumble time in ms (0 = no limit)"
+            default 0
+            range 0 600000
+            help
+                Stops the motor if it stays on this long without any new rumble command.
     endmenu
 
     menu "Energy control"
@@ -594,6 +614,82 @@ menu "BluControl Configuration"
             depends on BLUCONTROL_ENERGY_MODE_SOFTWARE && BLUCONTROL_ENERGY_BUTTONS_LENGTH >= 3
             help
                 GPIO Number for the Button 3 for waking up the controller. Must be a RTC GPIO, otherwise it'll not work.
+
+        config BLUCONTROL_ENERGY_POWER_ON_MS
+            int "Hold time to power on (ms)"
+            default 3000
+            range 0 10000
+            depends on BLUCONTROL_ENERGY_MODE_SOFTWARE
+            help
+                Waking-up Button 1 must be held this long after waking up, otherwise the
+                controller goes straight back to sleep (no accidental power-on in a bag).
+
+        config BLUCONTROL_ENERGY_POWER_OFF_MS
+            int "Hold time to power off (ms)"
+            default 5000
+            range 1000 20000
+            depends on BLUCONTROL_ENERGY_MODE_SOFTWARE
+            help
+                Holding Waking-up Button 1 alone this long while running puts the controller
+                to deep sleep (power off).
+
+        config BLUCONTROL_ENERGY_OTA_BUTTON_GPIO
+            int "Button held with the power button to enter OTA mode at power-on"
+            default -1
+            depends on BLUCONTROL_ENERGY_MODE_SOFTWARE
+            help
+                Holding Waking-up Button 1 and this button from power-on enters the OTA
+                (update) mode. Also cancels the power-off hold. -1 to disable.
+
+        config BLUCONTROL_ENERGY_OTA_MS
+            int "Hold time from power-on to enter OTA mode (ms)"
+            default 6000
+            range 1000 20000
+            depends on BLUCONTROL_ENERGY_MODE_SOFTWARE
+
+        config BLUCONTROL_ENERGY_PERIPH_POWER_GPIO
+            int "GPIO that switches the controller power on (-1 = none)"
+            default -1
+            range -1 33
+            depends on BLUCONTROL_ENERGY_MODE_SOFTWARE
+            help
+                Driven HIGH while the controller runs, LOW (and held) in deep sleep.
+                Used to cut the 5 V of a Dreamcast pad through a MOSFET switch.
+    endmenu
+
+    menu "GameCube pad read through its cable (Joybus)"
+        config BLUCONTROL_GC_CABLE
+            bool "Read an original GameCube pad through its cable data line"
+            default n
+            help
+                The ESP32 acts as the console on the pad's data wire (red).
+                Needs a 1k pull-up from the data line to 3V3.
+
+        config BLUCONTROL_GC_DATA_GPIO
+            int "GameCube data GPIO (red wire)"
+            default 21
+            range 0 31
+            depends on BLUCONTROL_GC_CABLE
+    endmenu
+
+    menu "Dreamcast (Maple bus)"
+        config BLUCONTROL_DREAMCAST
+            bool "Read an original Dreamcast pad through its Maple bus"
+            default n
+            help
+                The ESP32 acts as the console on the pad's 5-pin cable header.
+
+        config BLUCONTROL_MAPLE_A_GPIO
+            int "Maple SDCKA GPIO (pad header pin 1)"
+            default 21
+            range 0 31
+            depends on BLUCONTROL_DREAMCAST
+
+        config BLUCONTROL_MAPLE_B_GPIO
+            int "Maple SDCKB GPIO (pad header pin 5)"
+            default 22
+            range 0 31
+            depends on BLUCONTROL_DREAMCAST
     endmenu
 
     menu "Advanced"

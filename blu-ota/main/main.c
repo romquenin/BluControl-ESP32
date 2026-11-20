@@ -247,11 +247,98 @@ esp_err_t wifi_init_softap(void)
     return ESP_OK;
 }
 
+#if defined(CONFIG_BLUCONTROL_OTA_POWER_BUTTON_GPIO) && CONFIG_BLUCONTROL_OTA_POWER_BUTTON_GPIO >= 0
+#include "esp_sleep.h"
+#include "esp_timer.h"
+#include "driver/rtc_io.h"
+
+#define OTA_PWR_BTN CONFIG_BLUCONTROL_OTA_POWER_BUTTON_GPIO
+#ifdef CONFIG_BLUCONTROL_OTA_LED_ACTIVE_LOW
+    #define OTA_LED_OFF_LEVEL 1
+#else
+    #define OTA_LED_OFF_LEVEL 0
+#endif
+
+/*
+ * Controllers without a power switch: leave OTA mode by holding the power button
+ * (or after a timeout). The next start goes back to the game app, as after an
+ * update, and the controller sleeps until the power button is pressed.
+ */
+static void ota_power_off(void)
+{
+    ESP_LOGI(LOG_TAG, "Leaving OTA mode: powering off");
+    if (blinkTaskHandle != NULL)
+    {
+        vTaskDelete(blinkTaskHandle);
+        blinkTaskHandle = NULL;
+    }
+    boot_to_app(false);
+    esp_wifi_stop();
+
+    if (OTA_LED_GPIO >= 0)
+    {
+        gpio_set_level(OTA_LED_GPIO, OTA_LED_OFF_LEVEL);
+        gpio_hold_en(OTA_LED_GPIO);
+        gpio_deep_sleep_hold_en();
+    }
+
+    /* Wait for the button release, otherwise it wakes us up at once */
+    int released = 0;
+    for (int i = 0; i < 1500 && released < 10; i++)
+    {
+        released = gpio_get_level(OTA_PWR_BTN) ? released + 1 : 0;
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+
+    esp_sleep_enable_ext0_wakeup(OTA_PWR_BTN, 0);
+    rtc_gpio_pullup_en(OTA_PWR_BTN);
+    rtc_gpio_pulldown_dis(OTA_PWR_BTN);
+    esp_deep_sleep_start();
+}
+
+static void ota_power_button_task(void *obj)
+{
+    bool wait_release = true;   /* still held from the power-on combo */
+    int64_t hold_start = 0;
+    while (true)
+    {
+        bool pressed = gpio_get_level(OTA_PWR_BTN) == 0;
+        int64_t now = esp_timer_get_time() / 1000;
+        if (wait_release)
+        {
+            wait_release = pressed;
+        }
+        else if (pressed)
+        {
+            if (hold_start == 0)
+            {
+                hold_start = now;
+            }
+            else if (now - hold_start >= CONFIG_BLUCONTROL_OTA_POWER_OFF_MS)
+            {
+                ota_power_off();
+            }
+        }
+        else
+        {
+            hold_start = 0;
+        }
+#if CONFIG_BLUCONTROL_OTA_TIMEOUT_MIN > 0
+        if (now >= (int64_t)CONFIG_BLUCONTROL_OTA_TIMEOUT_MIN * 60 * 1000)
+        {
+            ota_power_off();
+        }
+#endif
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+    }
+}
+#endif
+
 void app_main(void)
 {
     ESP_LOGD(LOG_TAG, "BluControl OTA Mode. Reset by=%d. HEAP=%#010lx", esp_reset_reason(), esp_get_free_heap_size());
 
-    if (esp_reset_reason() == ESP_RST_POWERON)
+    if (esp_reset_reason() == ESP_RST_POWERON || esp_reset_reason() == ESP_RST_DEEPSLEEP)
     {
         boot_to_app(true);
         return;
@@ -270,6 +357,24 @@ void app_main(void)
         xTaskCreatePinnedToCore(ota_blink, "OTA_BLINK", 1024, NULL, tskIDLE_PRIORITY, &blinkTaskHandle, 1);
         configASSERT(blinkTaskHandle);
     }
+
+#if defined(CONFIG_BLUCONTROL_OTA_POWER_BUTTON_GPIO) && CONFIG_BLUCONTROL_OTA_POWER_BUTTON_GPIO >= 0
+    gpio_deep_sleep_hold_dis();
+    if (OTA_LED_GPIO >= 0)
+    {
+        gpio_hold_dis(OTA_LED_GPIO);
+    }
+    if (rtc_gpio_is_valid_gpio(OTA_PWR_BTN))
+    {
+        rtc_gpio_deinit(OTA_PWR_BTN);
+    }
+    gpio_reset_pin(OTA_PWR_BTN);
+    gpio_set_direction(OTA_PWR_BTN, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(OTA_PWR_BTN, GPIO_PULLUP_ONLY);
+    TaskHandle_t pwrTaskHandle = NULL;
+    xTaskCreatePinnedToCore(ota_power_button_task, "OTA_POWER_BTN", 3072, NULL, tskIDLE_PRIORITY + 1, &pwrTaskHandle, 1);
+    configASSERT(pwrTaskHandle);
+#endif
 
     ESP_LOGI(LOG_TAG, "BluControl. Started!\n");
 }

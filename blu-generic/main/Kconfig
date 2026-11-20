@@ -124,4 +124,5 @@ menu "BluControl Generic Configuration"
             help
                 Button Number for the right trigger when it activates. 0 if not being used
     endmenu
+
 endmenu
